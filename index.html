@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RiotHub Script Studio — Prison Life v4.0</title>
+  <meta name="description" content="RiotHub v4.0 for Roblox Prison Life (Latest) & Break In 2 — interactive GUI preview, script viewer, command reference, and one-click executor copy." />
+  <meta property="og:title" content="RiotHub Script Studio — Prison Life v4.0" />
+  <meta property="og:description" content="RiotHub v4.0 for Roblox Prison Life (Latest) & Break In 2 — interactive GUI preview, script viewer, command reference, and one-click executor copy." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+    body {
+      font-family: 'Inter', sans-serif;
+      background-color: #090a0f;
+      color: #eef0f6;
+    }
+    .mono {
+      font-family: 'JetBrains Mono', monospace;
+    }
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #12141d;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #ff445c;
+      border-radius: 3px;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col bg-[#090a0f] text-[#eef0f6] selection:bg-[#ff445c]/30 selection:text-white">
+  <!-- Top Header -->
+  <header class="border-b border-[#242838] bg-[#0e1017]/90 backdrop-blur sticky top-0 z-30">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-full bg-[#1a1d26] border border-[#ff445c] flex items-center justify-center font-extrabold text-sm text-[#ff445c] shadow-[0_0_15px_rgba(255,68,92,0.25)]">
+          RH
+        </div>
+        <div>
+          <div class="flex items-center gap-2">
+            <h1 class="font-extrabold tracking-tight text-base sm:text-lg text-white">RIOTHUB v4.0</h1>
+            <span class="text-[11px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-[#ff445c]/15 text-[#ff445c] border border-[#ff445c]/30">
+              Prison Life Latest
+            </span>
+          </div>
+          <p class="text-xs text-[#8e94a4] hidden sm:block">
+            Smart ItemHandler Snap-Bypass · True ShootEvent + ReloadEvent · TP-Punch · Target Fling · Car Spawner · Chat Admin
+          </p>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-2.5">
+        <button id="copyMainBtn" onclick="copyActiveScript()" class="px-4 py-2 rounded-lg bg-[#ff445c] hover:bg-[#ff586e] active:scale-[0.98] transition font-bold text-xs sm:text-sm text-white shadow-[0_0_20px_rgba(255,68,92,0.35)] flex items-center gap-2 cursor-pointer">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+          <span id="copyBtnLabel">Copy script.lua</span>
+        </button>
+        <a id="rawLinkBtn" href="/raw/script.lua" target="_blank" class="px-3 py-2 rounded-lg bg-[#1a1d26] hover:bg-[#242836] border border-[#303442] text-xs sm:text-sm font-semibold text-[#eef0f6] transition">
+          Raw File
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Workspace -->
+  <main class="max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1">
+    <!-- Left Column: Interactive In-Game Hub Replica (7 cols) -->
+    <section class="lg:col-span-7 flex flex-col gap-4">
+      <div class="flex items-center justify-between">
+        <div>
+          <h2 class="text-sm font-bold uppercase tracking-wider text-[#ff445c]">Interactive In-Game GUI Simulator</h2>
+          <p class="text-xs text-[#8e94a4]">Test the exact tabs, switches, presets, and chat commands inside RiotHub v4.0</p>
+        </div>
+        <span class="text-xs mono text-[#48db8e] bg-[#48db8e]/10 border border-[#48db8e]/30 px-2.5 py-1 rounded-md">
+          Keyless · Delta / Solara / Wave / PC & Mobile
+        </span>
+      </div>
+
+      <!-- Simulated Roblox Viewport + RiotHub v4.0 Window -->
+      <div class="relative rounded-2xl border border-[#282c3a] bg-gradient-to-br from-[#131622] via-[#0d0f17] to-[#17131c] p-3 sm:p-5 shadow-2xl overflow-hidden min-h-[490px] flex flex-col justify-between">
+        <!-- Toast Stack -->
+        <div id="simToastHost" class="absolute top-4 right-4 z-30 flex flex-col gap-2 w-60 pointer-events-none"></div>
+
+        <!-- RiotHub Window -->
+        <div class="w-full max-w-[640px] mx-auto bg-[#0c0d12] border border-[#303442] rounded-[14px] overflow-hidden shadow-[0_20px_60px_rgba(0,0,0,0.75)] flex flex-col h-[430px]">
+          <!-- TopBar -->
+          <div class="h-[42px] bg-[#12141b] relative flex items-center justify-between px-3.5 select-none">
+            <span class="font-bold text-[13px] tracking-wide text-[#eef0f6]">RIOTHUB v4.0 · PRISON LIFE (LATEST)</span>
+            <div class="flex items-center gap-1">
+              <span class="text-xs text-[#8e94a4] px-2 py-0.5 rounded bg-[#1a1d26] mono">RightCtrl / RH</span>
+            </div>
+            <div class="absolute bottom-0 left-0 right-0 h-[2px] bg-gradient-to-r from-[#ff445c] via-[#822230] to-[#0c0d12]"></div>
+          </div>
+
+          <!-- Body: Sidebar + Page Content -->
+          <div class="flex flex-1 min-h-0 p-1.5 gap-2">
+            <!-- Tabs Rail -->
+            <div id="simTabsRail" class="w-[122px] flex flex-col gap-1 overflow-y-auto pr-1"></div>
+
+            <!-- Content Holder -->
+            <div id="simContentHolder" class="flex-1 bg-[#12141b] rounded-[10px] p-2.5 overflow-y-auto flex flex-col gap-2"></div>
+          </div>
+
+          <!-- Status Footer -->
+          <div class="h-[26px] px-3 flex items-center justify-between text-[11px] text-[#8e94a4] border-t border-[#1b1e29] bg-[#0c0d12]">
+            <span id="simStatusText" class="mono truncate">v4.0 · 60 fps · 18 plrs · remotes: M+ S+ R+ I+</span>
+            <span class="mono text-[#48db8e] font-semibold" id="simActiveCount">3 ON</span>
+          </div>
+        </div>
+
+        <!-- Simulated Roblox Chat Command Bar -->
+        <form onsubmit="runSimChatCmd(event)" class="mt-3 flex items-center gap-2 max-w-[640px] w-full mx-auto">
+          <div class="flex-1 relative">
+            <input id="simChatInput" type="text" placeholder="Test chat command (e.g. :kill all, :guns, :mod, :car, :fling bob, :crim, :re)" class="w-full bg-[#12141b] border border-[#2c3040] focus:border-[#ff445c] rounded-lg px-3 py-2 text-xs text-white placeholder-[#687086] outline-none mono" />
+          </div>
+          <button type="submit" class="px-3.5 py-2 rounded-lg bg-[#1a1d26] hover:bg-[#252936] border border-[#303442] text-xs font-bold text-[#ff445c] transition cursor-pointer">
+            Run :Cmd
+          </button>
+        </form>
+      </div>
+
+      <!-- Technical Highlights Grid -->
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div class="p-3.5 rounded-xl bg-[#11131c] border border-[#232736]">
+          <div class="text-xs font-bold text-[#ff445c] uppercase mb-1">Smart ItemHandler Bypass</div>
+          <p class="text-xs text-[#8e94a4] leading-relaxed">
+            Saves CFrame, micro-snaps to <code class="text-white mono">ITEMPICKUP</code> for 0.07s, invokes server remote, and returns you seamlessly.
+          </p>
+        </div>
+        <div class="p-3.5 rounded-xl bg-[#11131c] border border-[#232736]">
+          <div class="text-xs font-bold text-[#48db8e] uppercase mb-1">True ShootEvent + Reload</div>
+          <p class="text-xs text-[#8e94a4] leading-relaxed">
+            Auto-equips gun, sends validated <code class="text-white mono">{Hit, Cframe, RayObject, Distance}</code> table, and fires <code class="text-white mono">ReloadEvent</code>.
+          </p>
+        </div>
+        <div class="p-3.5 rounded-xl bg-[#11131c] border border-[#232736]">
+          <div class="text-xs font-bold text-[#ffbc4c] uppercase mb-1">TP-Punch & SkidFling</div>
+          <p class="text-xs text-[#8e94a4] leading-relaxed">
+            Weaponless 15x <code class="text-white mono">meleeEvent</code> 1-hit KO bursts plus angular-velocity target flinging & anti-arrest protection.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Right Column: Full Source Code Viewer & Switcher (5 cols) -->
+    <section class="lg:col-span-5 flex flex-col gap-3 min-h-[540px]">
+      <div class="flex items-center justify-between gap-2">
+        <div class="flex items-center gap-1.5 bg-[#12141c] p-1 rounded-lg border border-[#242838]">
+          <button id="tabBtnPL" onclick="switchScriptFile('prisonLife')" class="px-3 py-1.5 rounded-md text-xs font-bold bg-[#ff445c] text-white transition cursor-pointer">
+            script.lua (Prison Life v4.0)
+          </button>
+          <button id="tabBtnBI2" onclick="switchScriptFile('breakIn2')" class="px-3 py-1.5 rounded-md text-xs font-bold text-[#8e94a4] hover:text-white transition cursor-pointer">
+            breakin2.lua (Break In 2)
+          </button>
+        </div>
+        <span id="scriptStatsBadge" class="text-xs mono text-[#8e94a4]">Loading...</span>
+      </div>
+
+      <!-- Search inside code -->
+      <div class="flex items-center gap-2">
+        <input id="codeSearchInput" oninput="filterCodePreview()" type="text" placeholder="Filter lines in script (e.g. ShootEvent, flingTarget, spawnCarHere, ItemHandler)..." class="w-full bg-[#12141c] border border-[#242838] focus:border-[#ff445c] rounded-lg px-3 py-2 text-xs text-white placeholder-[#687086] outline-none mono" />
+      </div>
+
+      <!-- Code Container -->
+      <div class="flex-1 relative rounded-xl border border-[#242838] bg-[#0c0e14] overflow-hidden flex flex-col min-h-[460px]">
+        <div class="px-3.5 py-2 bg-[#12141d] border-b border-[#242838] flex items-center justify-between text-xs">
+          <span id="codeHeaderTitle" class="mono font-semibold text-[#eef0f6]">/script.lua</span>
+          <div class="flex items-center gap-3">
+            <button onclick="copyActiveScript()" class="text-[#ff445c] hover:underline font-semibold cursor-pointer">Copy All</button>
+            <button onclick="downloadActiveScript()" class="text-[#48db8e] hover:underline font-semibold cursor-pointer">Download .lua</button>
+          </div>
+        </div>
+        <pre id="codeBlock" class="flex-1 p-3.5 overflow-auto text-[11px] leading-[1.55] mono text-[#c9d1e3] select-all whitespace-pre"></pre>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    let scriptsData = {
+      prisonLife: { filename: 'script.lua', content: '-- Loading script.lua...', lines: 0, bytes: 0 },
+      breakIn2: { filename: 'breakin2.lua', content: '-- Loading breakin2.lua...', lines: 0, bytes: 0 }
+    };
+    let activeKey = 'prisonLife';
+
+    // Interactive Simulator State
+    const simState = {
+      activeTab: 'HOME',
+      toggles: {
+        auraKillOn: false,
+        superPunchOn: false,
+        skipFF: true,
+        hitboxOn: false,
+        aimOn: false,
+        silentOn: false,
+        triggerOn: false,
+        auraArrestOn: false,
+        auraTazeOn: false,
+        loopKillTargetOn: false,
+        orbitTargetOn: false,
+        spectateTargetOn: false,
+        autoRearmOn: false,
+        autoReloadSrvOn: true,
+        infAmmo: true,
+        autoFire: true,
+        noclipOn: false,
+        infJump: false,
+        tpWalkOn: false,
+        flyOn: false,
+        carFlyOn: false,
+        carNoclipOn: false,
+        espOn: false,
+        chamsOn: false,
+        fullbrightOn: false,
+        antiStunOn: true,
+        antiArrestOn: false,
+        respawnDeathOn: false,
+        antiShieldOn: false,
+        antiCrimPadOn: false,
+        doorsRemovedOn: false
+      }
+    };
+
+    const SIM_TABS = [
+      {
+        id: 'HOME',
+        sections: [
+          {
+            title: 'One-Tap Power Actions',
+            pairs: [
+              ['Get All Guns + Mod', 'Granted Remington 870, AK-47, M9, Key card & applied 1-Shot Mod!', 'Kill All (Server)', 'Attacked 14 players via ShootEvent + TP-Punch'],
+              ['Arrest All', 'Cuffed all 9 arrestable inmates/criminals', 'Taze All', 'Remote-shocked server via Taser ShootEvent'],
+              ['Open Prison Gate', 'Triggered Prison Gate button via Smart Snap', 'Spawn Car Here', 'Spawned Sedan & pivoted VehicleSeat to your character'],
+              ['Refresh In Place (:re)', 'Invoked loadchar & restored exact CFrame', 'Fling All Players', 'Launched non-ForceField players via angular velocity']
+            ]
+          },
+          {
+            title: 'Quick Team Switch',
+            pairs: [
+              ['Become Guard', 'Switched to Bright blue (Guards)', 'Become Inmate', 'Switched to Bright orange (Inmates)'],
+              ['Become Criminal', 'Touched Criminal Spawn pad & returned', 'Solo Neutral', 'Switched to Medium stone grey']
+            ]
+          }
+        ]
+      },
+      {
+        id: 'COMBAT',
+        sections: [
+          {
+            title: 'Kill Aura & Super Punch',
+            toggles: [
+              ['auraKillOn', 'Kill Aura (Key: G)', 'Auto-kills every target in radius using Smart/Gun/Fists'],
+              ['superPunchOn', 'Super Punch / One-Punch (Key: F)', '1-hit KO with bare fists (15x meleeEvent burst)'],
+              [' hitboxOn', 'Expand Enemy Hitboxes (12 Studs)', 'Enlarges enemy Heads so every shot & punch connects']
+            ]
+          },
+          {
+            title: 'Aimbot & Silent Aim',
+            toggles: [
+              ['aimOn', 'Camera Aimbot', 'Locks camera onto nearest head inside FOV ring'],
+              ['silentOn', 'Silent Aim (ShootEvent Hook)', 'Redirects your gun bullets directly to the nearest enemy Head'],
+              ['triggerOn', 'TriggerBot', 'Auto-fires held weapon when crosshair passes over an enemy']
+            ]
+          },
+          {
+            title: 'Arrest & Taze Auras',
+            toggles: [
+              ['auraArrestOn', 'Arrest Aura (Key: H)', 'Auto-snaps behind & cuffs any arrestable player in range'],
+              ['auraTazeOn', 'Taze Loop Aura (Key: J)', 'Continuously remote-tazes non-guards across the server']
+            ]
+          }
+        ]
+      },
+      {
+        id: 'TARGET',
+        sections: [
+          {
+            title: 'Single-Target Actions (Target: xX_PrisonGuard_Xx)',
+            pairs: [
+              ['Kill Target (Smart)', 'Fired 12x Head bullets + ReloadEvent at target', 'TP-Punch Kill (No Gun)', 'Snapped to target, fired 15x meleeEvent, returned!'],
+              ['Fling Target (Launch)', 'Applied 9e7 BodyVelocity + RotVelocity intersection!', 'Arrest Target', 'Snapped behind target Torso & invoked arrest remote'],
+              ['Taze Target', 'Fired Taser beam at target Torso', 'Teleport To Target', 'Warped 2.5 studs behind target']
+            ]
+          },
+          {
+            title: 'Persistent Target Loops',
+            toggles: [
+              ['loopKillTargetOn', 'Loopkill Selected Target', 'Automatically kills the selected target every time they respawn'],
+              ['orbitTargetOn', 'Orbit / Annoy Target', 'Circles rapidly around the selected target player'],
+              ['spectateTargetOn', 'Spectate / View Target', 'Locks your camera onto the selected target']
+            ]
+          }
+        ]
+      },
+      {
+        id: 'GUNS',
+        sections: [
+          {
+            title: 'Weapon Giver (Smart Snap + Spoof)',
+            pairs: [
+              ['Give Remington 870', 'Pulled Remington 870 via Smart Snap-Back', 'Give All Guns + Mod', 'Pulled full arsenal & modded GunStates'],
+              ['1-Shot Laser Preset', '105 DMG · 0 Spread · 0.001s FireRate · 14x Bullets', 'Wall-of-Lead Shotgun', '28 Pellets · Full Auto · Infinite Ammo']
+            ]
+          },
+          {
+            title: 'GunStates & Server Sync',
+            toggles: [
+              ['autoRearmOn', 'Auto Re-Arm + Mod On Respawn', 'Automatically pulls guns & applies mods every respawn'],
+              ['autoReloadSrvOn', 'Auto Server Reload (ReloadEvent)', 'Continuously refills server-side ammo so modded guns never dry-fire'],
+              ['infAmmo', 'Infinite Ammo', 'CurrentAmmo pinned to math.huge'],
+              ['autoFire', 'Full Automatic', 'Converts M9 & Remington 870 to full auto']
+            ]
+          }
+        ]
+      },
+      {
+        id: 'MOVE & CAR',
+        sections: [
+          {
+            title: 'Locomotion & Flight',
+            toggles: [
+              ['noclipOn', 'Noclip (Phase Through Walls)', 'Walk straight through prison doors, cells, and walls'],
+              ['infJump', 'Infinite Jump', 'Chain jumps mid-air infinitely'],
+              ['tpWalkOn', 'TP-Walk (CFrame Speed)', 'Translates HumanoidRootPart along MoveDirection'],
+              ['flyOn', 'Fly (Key: Z + Mobile Fly Pad)', 'Smooth camera-directed flight with zero drift']
+            ]
+          },
+          {
+            title: 'Vehicle Spawner & Car Mods',
+            pairs: [
+              ['Spawn Sedan Here', 'Brought Sedan to your CFrame & seated character', 'Spawn Police Squad Here', 'Brought Police Cruiser to your CFrame'],
+              ['Boost Seated Car (3x)', 'Applied MaxSpeed = 180, Torque = 120000', 'Teleport Nearest Car', 'Warped into nearest VehicleSeat']
+            ],
+            toggles: [
+              ['carFlyOn', 'Car Fly (Drive In The Sky)', 'Fly any vehicle while seated in the driver seat'],
+              ['carNoclipOn', 'Car Noclip', 'Drive vehicles straight through fences & prison walls']
+            ]
+          }
+        ]
+      },
+      {
+        id: 'VISUALS',
+        sections: [
+          {
+            title: 'ESP, Chams & World',
+            toggles: [
+              ['espOn', 'Enable Player ESP', 'Shows Name, HP%, Distance, and Equipped Weapon'],
+              ['chamsOn', 'Team Chams (Through-Wall Highlights)', 'Blue = Guard · Orange = Inmate · Red = Criminal'],
+              ['fullbrightOn', 'Fullbright (No Night / Fog)', 'Removes darkness, shadows, and fog']
+            ]
+          }
+        ]
+      },
+      {
+        id: 'TELEPORT',
+        sections: [
+          {
+            title: 'Key Prison Locations',
+            pairs: [
+              ['Prison Yard', 'Teleported to Prison Yard', 'Nexus / Hallway', 'Teleported to Main Nexus'],
+              ['Guard Armory', 'Teleported inside Guard Armory', 'Criminal Base', 'Teleported to Criminal Warehouse'],
+              ['Cafeteria', 'Teleported to Cafeteria', 'Prison Roof', 'Teleported to Rooftop'],
+              ['Gate Control Room', 'Teleported to Gate Switch Room', 'Sewer Escape', 'Teleported to Escape Sewer']
+            ]
+          }
+        ]
+      },
+      {
+        id: 'WORLD',
+        sections: [
+          {
+            title: 'Character Protections & Map Control',
+            toggles: [
+              ['antiStunOn', 'Anti-Taze / Anti-Stun', 'Prevents taser from freezing you or locking your Backpack UI'],
+              ['antiArrestOn', 'Anti-Arrest (Auto-Break Cuffs)', 'Instantly respawns & returns you to your spot if cuffed'],
+              ['respawnDeathOn', 'Respawn Where You Died', 'Auto-respawns via loadchar and teleports back to your death spot'],
+              ['antiShieldOn', 'Anti-Riot Shield', 'Strips Riot Shields from Guards so bullets never get blocked'],
+              ['antiCrimPadOn', 'Anti-Criminal Spawn Pad', 'Lets Guards walk into Criminal Base without getting team-switched'],
+              ['doorsRemovedOn', 'Remove All Doors & Fences (Reversible)', 'Stashes Doors & Fences in hidden folder — toggle OFF to restore!']
+            ]
+          }
+        ]
+      },
+      {
+        id: 'SETUP',
+        sections: [
+          {
+            title: 'Configuration & Session',
+            pairs: [
+              ['Save Config', 'Saved RiotHub_v4_Config.json', 'Load Config', 'Loaded saved settings into CONFIG'],
+              ['Rebind Remotes', 'Verified ItemHandler, ShootEvent, ReloadEvent, meleeEvent', 'Rejoin Server', 'Teleporting to fresh Prison Life instance']
+            ]
+          }
+        ]
+      }
+    ];
+
+    function simToast(title, body) {
+      const host = document.getElementById('simToastHost');
+      const el = document.createElement('div');
+      el.className = 'bg-[#1a1d26] border border-[#ff445c]/50 rounded-lg p-2.5 shadow-xl flex gap-2 items-start transition-all duration-200';
+      el.innerHTML = `
+        <div class="w-1 self-stretch bg-[#ff445c] rounded"></div>
+        <div class="flex-1 min-w-0">
+          <div class="text-xs font-bold text-white truncate">${title}</div>
+          <div class="text-[11px] text-[#8e94a4] leading-snug">${body}</div>
+        </div>
+      `;
+      host.prepend(el);
+      document.getElementById('simStatusText').textContent = `${title} -> ${body}`;
+      setTimeout(() => {
+        el.style.opacity = '0';
+        setTimeout(() => el.remove(), 200);
+      }, 2200);
+    }
+
+    function renderSimulator() {
+      const rail = document.getElementById('simTabsRail');
+      const content = document.getElementById('simContentHolder');
+      rail.innerHTML = '';
+      content.innerHTML = '';
+
+      SIM_TABS.forEach(tab => {
+        const active = tab.id === simState.activeTab;
+        const btn = document.createElement('button');
+        btn.className = `w-full h-[29px] px-2.5 rounded-lg text-left font-bold text-[11px] flex items-center gap-2 transition cursor-pointer ${
+          active ? 'bg-[#1a1d26] text-white' : 'bg-[#0c0d12] text-[#8e94a4] hover:text-white'
+        }`;
+        btn.innerHTML = `
+          <span class="w-[3px] h-[14px] rounded ${active ? 'bg-[#ff445c]' : 'bg-transparent'}"></span>
+          <span>${tab.id}</span>
+        `;
+        btn.onclick = () => {
+          simState.activeTab = tab.id;
+          renderSimulator();
+        };
+        rail.appendChild(btn);
+      });
+
+      const currentTab = SIM_TABS.find(t => t.id === simState.activeTab);
+      if (!currentTab) return;
+
+      currentTab.sections.forEach(sec => {
+        const secHeader = document.createElement('div');
+        secHeader.className = 'pt-1 pb-0.5 border-b border-[#303442]/60 text-[11px] font-bold uppercase tracking-wider text-[#ff445c]';
+        secHeader.textContent = sec.title;
+        content.appendChild(secHeader);
+
+        if (sec.pairs) {
+          sec.pairs.forEach(pair => {
+            const row = document.createElement('div');
+            row.className = 'grid grid-cols-2 gap-1.5';
+            row.innerHTML = `
+              <button class="h-[34px] rounded-lg bg-[#1a1d26] hover:bg-[#242836] active:scale-[0.99] text-xs font-bold text-[#eef0f6] px-2.5 truncate cursor-pointer transition">${pair[0]}</button>
+              <button class="h-[34px] rounded-lg bg-[#1a1d26] hover:bg-[#242836] active:scale-[0.99] text-xs font-bold text-[#eef0f6] px-2.5 truncate cursor-pointer transition">${pair[2]}</button>
+            `;
+            const btns = row.querySelectorAll('button');
+            btns[0].onclick = () => simToast(pair[0], pair[1]);
+            btns[1].onclick = () => simToast(pair[2], pair[3]);
+            content.appendChild(row);
+          });
+        }
+
+        if (sec.toggles) {
+          sec.toggles.forEach(([key, label, desc]) => {
+            const cleanKey = key.trim();
+            const isOn = !!simState.toggles[cleanKey];
+            const row = document.createElement('button');
+            row.className = `w-full text-left rounded-lg bg-[#1a1d26] hover:bg-[#212531] px-3 py-2 flex items-center justify-between gap-3 transition cursor-pointer border ${
+              isOn ? 'border-[#ff445c]/60' : 'border-transparent'
+            }`;
+            row.innerHTML = `
+              <div class="min-w-0">
+                <div class="text-xs font-bold text-[#eef0f6]">${label}</div>
+                <div class="text-[10px] text-[#8e94a4] truncate">${desc}</div>
+              </div>
+              <div class="w-10 h-[22px] rounded-full p-[3px] transition-colors flex items-center ${
+                isOn ? 'bg-[#48db8e] justify-end' : 'bg-[#343742] justify-start'
+              }">
+                <div class="w-4 h-4 rounded-full bg-white shadow"></div>
+              </div>
+            `;
+            row.onclick = () => {
+              simState.toggles[cleanKey] = !simState.toggles[cleanKey];
+              simToast(label, simState.toggles[cleanKey] ? 'Enabled (ON)' : 'Disabled (OFF)');
+              renderSimulator();
+            };
+            content.appendChild(row);
+          });
+        }
+      });
+
+      const onCount = Object.values(simState.toggles).filter(Boolean).length;
+      document.getElementById('simActiveCount').textContent = `${onCount} ON`;
+    }
+
+    function runSimChatCmd(e) {
+      e.preventDefault();
+      const input = document.getElementById('simChatInput');
+      const val = input.value.trim();
+      if (!val) return;
+      simToast('Chat Command Executed', val);
+      input.value = '';
+    }
+
+    async function loadScripts() {
+      try {
+        const res = await fetch('/api/scripts');
+        scriptsData = await res.json();
+        updateCodeView();
+      } catch (err) {
+        console.error('Failed to load scripts:', err);
+      }
+    }
+
+    function switchScriptFile(key) {
+      activeKey = key;
+      const btnPL = document.getElementById('tabBtnPL');
+      const btnBI2 = document.getElementById('tabBtnBI2');
+      if (key === 'prisonLife') {
+        btnPL.className = 'px-3 py-1.5 rounded-md text-xs font-bold bg-[#ff445c] text-white transition cursor-pointer';
+        btnBI2.className = 'px-3 py-1.5 rounded-md text-xs font-bold text-[#8e94a4] hover:text-white transition cursor-pointer';
+      } else {
+        btnBI2.className = 'px-3 py-1.5 rounded-md text-xs font-bold bg-[#ff445c] text-white transition cursor-pointer';
+        btnPL.className = 'px-3 py-1.5 rounded-md text-xs font-bold text-[#8e94a4] hover:text-white transition cursor-pointer';
+      }
+      updateCodeView();
+    }
+
+    function updateCodeView() {
+      const info = scriptsData[activeKey];
+      if (!info) return;
+      document.getElementById('copyBtnLabel').textContent = `Copy ${info.filename}`;
+      document.getElementById('rawLinkBtn').href = `/raw/${info.filename}`;
+      document.getElementById('codeHeaderTitle').textContent = `/${info.filename}`;
+      document.getElementById('scriptStatsBadge').textContent = `${info.lines.toLocaleString()} lines · ${(info.bytes / 1024).toFixed(1)} KB`;
+      filterCodePreview();
+    }
+
+    function filterCodePreview() {
+      const info = scriptsData[activeKey];
+      if (!info) return;
+      const q = document.getElementById('codeSearchInput').value.trim().toLowerCase();
+      const block = document.getElementById('codeBlock');
+      if (!q) {
+        block.textContent = info.content;
+        return;
+      }
+      const matched = info.content
+        .split('\n')
+        .map((line, i) => ({ line, num: i + 1 }))
+        .filter(item => item.line.toLowerCase().includes(q))
+        .map(item => `${String(item.num).padStart(4, ' ')}: ${item.line}`)
+        .join('\n');
+      block.textContent = matched || `-- No lines matching "${q}"`;
+    }
+
+    async function copyActiveScript() {
+      const info = scriptsData[activeKey];
+      if (!info) return;
+      await navigator.clipboard.writeText(info.content);
+      const lbl = document.getElementById('copyBtnLabel');
+      const prev = lbl.textContent;
+      lbl.textContent = `Copied ${info.filename}!`;
+      simToast('Clipboard', `Copied ${info.filename} (${info.lines} lines)`);
+      setTimeout(() => { lbl.textContent = prev; }, 1800);
+    }
+
+    function downloadActiveScript() {
+      const info = scriptsData[activeKey];
+      if (!info) return;
+      const blob = new Blob([info.content], { type: 'text/plain;charset=utf-8' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = info.filename;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+
+    renderSimulator();
+    loadScripts();
+  </script>
+</body>
+</html>

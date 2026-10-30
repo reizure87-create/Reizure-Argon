@@ -1,0 +1,20 @@
+{
+  "name": "riothub-script-studio",
+  "version": "4.0.0",
+  "description": "RiotHub v4.0 — Prison Life (Latest) & Break In 2 Lua Script Hub & Interactive GUI Preview",
+  "main": "server.ts",
+  "scripts": {
+    "dev": "node server.ts",
+    "start": "node server.ts",
+    "build": "node server.ts --check",
+    "lint": "node server.ts --check"
+  },
+  "keywords": [
+    "roblox",
+    "luau",
+    "prison-life",
+    "riothub"
+  ],
+  "author": "",
+  "license": "ISC"
+}
