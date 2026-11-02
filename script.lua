@@ -1,3793 +1,4413 @@
 --[[
-	RiotHub v4.0 — Prison Life (Latest 2025/2026 Edition)
-	All-in-One GUI + Admin Command Engine · Keyless · Single File
-	Compatible with Delta / Solara / Codex / Xeno / Wave / Krnl / Potassium / Mobile & PC
+    RIOT HUB MOBILE v4.0  //  PRISON LIFE
+    A mobile-first rebuild of RiotHub for Prison Life.
 
-	WHAT'S NEW IN v4.0 (LATEST PRISON LIFE PATCH READY):
-	  - Smart ItemHandler Bypass: Supports CFrame Snap-Back + Position Table Spoof
-	    so grabbing guns, keycards, and opening gates works even on distance-checked servers.
-	  - True Server ShootEvent Engine: Sends the exact {Hit, Cframe, RayObject, Distance}
-	    bullet structure the server validates, auto-equips the weapon, and fires
-	    ReloadEvent so server-side ammo never runs dry.
-	  - TP-Punch Kill & Super Punch (One-Punch KO): Instant weaponless kills using
-	    distance-validated meleeEvent bursts.
-	  - Target Manager & Troll Suite: Target selector, Loopkill, Fling (SkidFling
-	    velocity launcher), Orbit/Annoy, Spectate/View, Arrest, Taze, Goto.
-	  - Vehicle Spawner & Car Mods: Remote-spawn Police/Squad cars directly to your
-	    character, Car Fly, Car Speed/Torque boost, and Car Noclip.
-	  - Full Protection Suite: Anti-Taze (restores WalkSpeed + Backpack UI),
-	    Anti-Arrest (auto-breaks cuffs & returns to position), Anti-Shield,
-	    Anti-Criminal Pad (Guards can enter Crim Base), Respawn Where You Died.
-	  - Built-in PrizzLife/Tiger-style Chat Commands (:kill, :loopkill, :fling,
-	    :arrest, :taze, :car, :guns, :mod, :crim, :guard, :inmate, :re, :gate, etc.)
+    Design contract
+      * The phone layout is the primary layout. 320 px wide is the smallest
+        supported viewport; every interactive row is at least 44 px tall.
+      * ScreenGui uses CoreUISafeInsets + ClipToDeviceSafeArea, so the hub
+        stays below the Roblox topbar and inside the device safe area.
+      * The layout is recomputed when Camera.ViewportSize changes (rotation).
+      * Dragging is clamped and follows the originating InputObject. No
+        global "one finger moves everything" handlers.
+      * Unload restores movement, noclip, lighting, particles, camera FOV,
+        gun-module fields, barriers, the silent-aim hook, ESP and the GUI.
 
-	CONTROLS
-	  - Mobile: Tap the draggable "RH" button on the left edge to toggle the hub.
-	  - PC Keys: RightCtrl / U = Toggle UI | G = Kill Aura | H = Arrest Aura
-	             J = Taze Loop | F = Super Punch | Z = Fly | F3 = Open Gate
+    Honesty contract
+      * "Sent" means the client call completed. It does not claim the server
+        accepted it. Arrest/team results are checked on the client where the
+        game exposes the result; otherwise the toast says "request sent".
+      * Every remote call is pcall-guarded and written to the in-hub log.
+      * No feature claims to bypass server anti-cheat.
+
+    The attached PL-Vortex-7.1 and the previous Riothub.lua are preserved.
 ]]
 
--- ============================================================================
--- SERVICES & ENVIRONMENT
--- ============================================================================
-local plrs        = game:GetService("Players")
-local rs          = game:GetService("ReplicatedStorage")
-local runSvc      = game:GetService("RunService")
-local uis         = game:GetService("UserInputService")
-local tweSvc      = game:GetService("TweenService")
-local httpSvc     = game:GetService("HttpService")
-local starterGui  = game:GetService("StarterGui")
-local teleportSvc = game:GetService("TeleportService")
-local virtualUser = game:GetService("VirtualUser")
-local lighting    = game:GetService("Lighting")
-
-local lp = plrs.LocalPlayer
-if not lp then
-	local waited = 0
-	while not plrs.LocalPlayer and waited < 20 do
-		task.wait(0.25)
-		waited = waited + 0.25
-	end
-	lp = plrs.LocalPlayer
-end
-if not lp then
-	error("[RiotHub] No LocalPlayer present — join Prison Life first, then execute.", 0)
-end
-
-local mouse = lp:GetMouse()
-
-local function currentCam()
-	return workspace.CurrentCamera
-end
-
-local function getGenv()
-	if getgenv then return getgenv() end
-	if not _G.__RiotHubGenv then _G.__RiotHubGenv = {} end
-	return _G.__RiotHubGenv
-end
-
--- Cleanly unload any previous instance so re-execution never duplicates hooks/UI
-pcall(function()
-	if getGenv().RiotHub and getGenv().RiotHub.Unload then
-		getGenv().RiotHub.Unload()
-	end
-end)
-pcall(function()
-	local parents = {}
-	if gethui then pcall(function() table.insert(parents, gethui()) end) end
-	table.insert(parents, game:FindFirstChildOfClass("CoreGui"))
-	table.insert(parents, lp and lp:FindFirstChild("PlayerGui"))
-	for _, parent in ipairs(parents) do
-		if parent then
-			for _, name in ipairs({
-				"RiotHub_GUI", "RiotHubFOVRing", "RiotHubEspOverlays",
-				"RiotHub_FlyPad", "RiotHub_Toasts", "RiotHub_PunchBtn",
-			}) do
-				local old = parent:FindFirstChild(name)
-				if old then old:Destroy() end
-			end
-		end
-	end
-end)
-
--- ============================================================================
--- CONFIGURATION
--- ============================================================================
-local CONFIG = {
-	-- Combat & Auras
-	killAuraRadius    = 50,
-	killAuraRate      = 0.25,
-	killAuraIgnoreFF  = true,
-	killAuraMode      = "Smart (Gun + Fists)", -- "Smart (Gun + Fists)" | "Fists" | "Gun"
-	meleeBurstHits    = 14,
-	gunBulletsPerCall = 10,
-	arrestAuraRadius  = 100,
-	arrestAuraRate    = 0.9,
-	arrestSnap        = true,
-	tazeRate          = 0.6,
-	auraTargets       = "All",
-	aimbotTargets     = "All",
-	triggerTargets    = "All",
-	superPunch        = false,
-
-	-- Hitbox Expander
-	hitboxEnabled     = false,
-	hitboxSize        = 12,
-	hitboxPart        = "Head", -- "Head" | "HumanoidRootPart"
-	hitboxTransparency = 0.65,
-
-	-- Aimbot & Silent Aim
-	aimbotFov         = 150,
-	aimbotSmooth      = 30,
-	showAimFov        = true,
-	silentFov         = 360,
-	silentHitChance   = 100,
-	silentWallCheck   = false,
-	silentRandomPart  = false,
-
-	-- Guns & Item Handler
-	gunChoice         = "Remington 870",
-	pickupMethod      = "Smart Snap + Spoof", -- "Smart Snap + Spoof" | "CFrame Snap-Back" | "Remote Spoof Only"
-	modTarget         = "All Tools",
-	gunDamage         = 100,
-	gunBullets        = 12,
-	gunFireRate       = 0.001,
-	gunSpread         = 0,
-	gunInfiniteAmmo   = true,
-	gunAutoFire       = true,
-	autoRearm         = false,
-	autoReloadServer  = true,
-
-	-- Visuals & ESP
-	espNames          = true,
-	espDistance       = true,
-	espHealthBar      = true,
-	espTeamColor      = true,
-	espVisibleOnly    = false,
-	espTracers        = false,
-	chamsThroughWalls = true,
-
-	-- Movement & Flight
-	walkSpeed         = 16,
-	jumpPower         = 50,
-	tpWalkPower       = 3,
-	flySpeed          = 4,
-	spinSpeed         = 30,
-
-	-- Vehicles
-	carSpeedMult      = 2.0,
-	carFlySpeed       = 4,
-
-	-- Protections & World
-	noStayStunned     = true,
-	antiArrest        = false,
-	antiShield        = false,
-	antiCrimPad       = false,
-	respawnAtDeath    = false,
-	instantRespawn    = false,
-	gateSpamInterval  = 1.5,
-	autoCollectRadius = 200,
-
-	-- System
-	safePacing        = false, -- Snap-back works rapidly; enable pacing only on strict custom servers
-	itemPace          = 0.35,
-	maxLogLines       = 45,
-	clickArrest       = false,
-	clickTp           = false,
-	reduceAnim        = false,
-	antiAfk           = true,
-	chatCmds          = true,
-	waypoints         = {},
+local VERSION = "4.0"
+local R = {
+    version = VERSION,
+    name = "RiotHub Mobile",
+    services = {},
+    config = {},
+    state = {},
+    ui = {},
+    pages = {},
+    remotes = {},
 }
 
--- ============================================================================
--- RUNTIME STATE
--- ============================================================================
-local state = {
-	toggles         = {},
-	switches        = {},
-	espUnits        = {},
-	tracers         = {},
-	killCounter     = 0,
-	arrestCount     = 0,
-	itemCount       = 0,
-	fps             = 60,
-	detached        = false,
-	logCounter      = 0,
-	lastItemPull    = 0,
-	touchMove       = { fwd = 0, back = 0, up = 0, down = 0 },
-	noclipSaved     = {},
-	hitboxSaved     = {},
-	carNoclipSaved  = {},
-	uiAnim          = 0.14,
-	selectedTarget  = nil,
-	loopKillTargets = {}, -- [playerName] = true
-	loopTazeTargets = {}, -- [playerName] = true
-	lastDeathCF     = nil,
-	preArrestCF     = nil,
-	hiddenWorld     = nil,
-	flinging        = false,
+local SERVICES = {
+    "Players", "ReplicatedStorage", "RunService", "UserInputService",
+    "TweenService", "HttpService", "StarterGui", "TeleportService",
+    "VirtualUser", "Lighting", "GuiService", "Workspace",
+}
+for _, serviceName in ipairs(SERVICES) do
+    local ok, service = pcall(function() return game:GetService(serviceName) end)
+    if ok then R.services[serviceName] = service end
+end
+
+local Players = R.services.Players
+local UIS = R.services.UserInputService
+local RunService = R.services.RunService
+local TweenService = R.services.TweenService
+
+local function waitForLocalPlayer()
+    if Players.LocalPlayer then return Players.LocalPlayer end
+    local waited = 0
+    while not Players.LocalPlayer and waited < 20 do
+        task.wait(0.25)
+        waited = waited + 0.25
+    end
+    return Players.LocalPlayer
+end
+
+R.lp = waitForLocalPlayer()
+if not R.lp then
+    error("[RiotHub] no LocalPlayer — join Prison Life, then execute", 0)
+end
+
+R.unpack = table.unpack or unpack
+R.env = (getgenv and getgenv()) or _G
+if type(R.env.RiotHubMobile) == "table"
+    and type(R.env.RiotHubMobile.Unload) == "function" then
+    pcall(R.env.RiotHubMobile.Unload)
+end
+
+-- Remove stale screens from earlier runs even if their genv table is gone.
+do
+    local parents = {}
+    local ok, playerGui = pcall(function() return R.lp:FindFirstChild("PlayerGui") end)
+    if ok and playerGui then table.insert(parents, playerGui) end
+    if gethui then pcall(function() table.insert(parents, gethui()) end) end
+    local okCore, coreGui = pcall(function() return game:FindFirstChildOfClass("CoreGui") end)
+    if okCore and coreGui then table.insert(parents, coreGui) end
+    for _, parent in ipairs(parents) do
+        for _, screenName in ipairs({
+            "RiotHubMobile_GUI", "RiotHubMobile_Picker", "RiotHubMobile_FOV",
+            "RiotHubMobile_ESP", "RiotHub_GUI", "RiotHubFOVRing",
+        }) do
+            local old = parent:FindFirstChild(screenName)
+            if old then pcall(function() old:Destroy() end) end
+        end
+    end
+end
+
+R.config = {
+    -- combat
+    killAuraRadius = 60,
+    killAuraRate = 0.30,
+    killAuraMode = "Fists",
+    meleeBurstHits = 4,
+    gunBulletsPerCall = 8,
+    respectForcefield = true,
+    auraTargets = "All",
+    arrestAuraRadius = 120,
+    arrestAuraRate = 1.2,
+    arrestSnap = true,
+    tazeRate = 0.8,
+    -- aim
+    aimbotFov = 160,
+    aimbotSmooth = 35,
+    aimbotTargets = "All",
+    aimAlwaysLock = false,
+    silentFov = 999,
+    silentHitChance = 100,
+    silentWallCheck = true,
+    silentRandomPart = false,
+    triggerOn = false,
+    showAimFov = true,
+    -- guns
+    gunChoice = "M9",
+    gunDamage = 65,
+    gunBullets = 10,
+    gunFireRate = 0.001,
+    gunSpread = 0,
+    gunInfiniteAmmo = true,
+    gunAutoFire = true,
+    autoRearm = false,
+    autoCollectRadius = 200,
+    itemPace = 3.2,
+    -- visuals
+    espNames = true,
+    espDistance = true,
+    espHealth = true,
+    espTeamColor = true,
+    espVisibleOnly = false,
+    espTracers = false,
+    chamsThroughWalls = true,
+    -- movement
+    walkSpeed = 16,
+    jumpPower = 50,
+    tpWalkPower = 3,
+    flySpeed = 3,
+    spinSpeed = 25,
+    cameraFov = 70,
+    -- world
+    gateSpamInterval = 1.5,
+    antiAfk = true,
+    instantRespawn = false,
+    antiStun = false,
+    reduceAnim = false,
+    quickDock = true,
+    -- system
+    maxLogLines = 60,
 }
 
-local connections = {}
-local function connect(signal, fn)
-	local c = signal:Connect(fn)
-	table.insert(connections, c)
-	return c
-end
-
--- ============================================================================
--- UTILITIES, LOGGING & NOTIFICATIONS
--- ============================================================================
-local function spread(t)
-	if unpack then return unpack(t) end
-	return table.unpack(t)
-end
-
-local function packArgs(...)
-	local n, t = select("#", ...), {}
-	for i = 1, n do t[i] = select(i, ...) end
-	return t
-end
-
-local log
-local function vsafe(fn, ...)
-	local args = packArgs(...)
-	local ok, err = pcall(function() fn(spread(args)) end)
-	if not ok then
-		log("remote err: " .. tostring(err):sub(1, 100), true)
-	end
-	return ok
-end
-
-local toast = function() end
-local logScroll, logText
-
-log = function(msg, isErr)
-	local body = tostring(msg)
-	if #body > 150 then body = body:sub(1, 150) .. "..." end
-	print("[RiotHub] " .. body)
-	if logText then
-		state.logCounter = state.logCounter + 1
-		logText.Text = logText.Text .. "\n" .. string.format("%3d) %s%s",
-			state.logCounter % 1000, isErr and "[ERR] " or "", body)
-		local n = 0
-		for _ in string.gmatch(logText.Text, "[^\n]+") do n = n + 1 end
-		while n > CONFIG.maxLogLines do
-			local _, rest = string.match(logText.Text, "([^\n]-\n)(.+)$")
-			if not rest then break end
-			logText.Text = rest
-			n = n - 1
-		end
-		if logScroll then
-			logScroll.CanvasSize = UDim2.new(0, 0, 0, n * 14 + 24)
-			logScroll.CanvasPosition = Vector2.new(0, n * 14 + 24)
-		end
-	end
-end
-
-local function notify(title, text, dur)
-	pcall(function()
-		starterGui:SetCore("SendNotification", { Title = title, Text = text, Duration = dur or 3 })
-	end)
-end
-
-local function pace()
-	local now = tick()
-	if CONFIG.safePacing then
-		local left = state.lastItemPull + CONFIG.itemPace - now
-		if left > 0 then task.wait(left) end
-	end
-	state.lastItemPull = tick()
-end
-
--- ============================================================================
--- CHARACTER & PLAYER HELPERS
--- ============================================================================
-local function charHumanoid(plr)
-	plr = plr or lp
-	local ch = plr and plr.Character
-	return ch and ch:FindFirstChildOfClass("Humanoid")
-end
-
-local function charRoot(plr)
-	plr = plr or lp
-	local ch = plr and plr.Character
-	if not ch then return nil end
-	return ch:FindFirstChild("HumanoidRootPart")
-		or ch:FindFirstChild("Torso")
-		or ch:FindFirstChild("UpperTorso")
-		or ch.PrimaryPart
-end
-
-local function charTorso(plr)
-	plr = plr or lp
-	local ch = plr and plr.Character
-	if not ch then return nil end
-	return ch:FindFirstChild("Torso")
-		or ch:FindFirstChild("UpperTorso")
-		or ch:FindFirstChild("HumanoidRootPart")
-end
-
-local function charHead(plr)
-	plr = plr or lp
-	local ch = plr and plr.Character
-	return ch and ch:FindFirstChild("Head")
-end
-
-local function findPlayerByQuery(q)
-	if not q or q == "" then return nil end
-	local low = string.lower(tostring(q))
-	if low == "me" or low == "self" then return lp end
-	for _, p in ipairs(plrs:GetPlayers()) do
-		if string.lower(p.Name) == low or string.lower(p.DisplayName) == low then
-			return p
-		end
-	end
-	for _, p in ipairs(plrs:GetPlayers()) do
-		if string.sub(string.lower(p.Name), 1, #low) == low
-			or string.sub(string.lower(p.DisplayName), 1, #low) == low then
-			return p
-		end
-	end
-	return nil
-end
-
-local function getActiveTarget()
-	if state.selectedTarget and state.selectedTarget.Parent == plrs then
-		return state.selectedTarget
-	end
-	return nil
-end
-
--- ============================================================================
--- REMOTE RESOLUTION (ASYNC + ON-DEMAND REBIND)
--- ============================================================================
-local function remoteFolder()
-	return workspace:FindFirstChild("Remote")
-end
-
-local function getRemote(name, timeout)
-	local folder = remoteFolder()
-	if not folder then return nil end
-	return folder:FindFirstChild(name) or (timeout and folder:WaitForChild(name, timeout) or nil)
-end
-
-local ItemHandler, shootingEvent, meleeEvent, reloadEvent, soundEvent
-
-local function resolveRemotesAsync()
-	task.spawn(function()
-		local folder = remoteFolder() or workspace:WaitForChild("Remote", 15)
-		if folder then
-			ItemHandler = folder:FindFirstChild("ItemHandler") or folder:WaitForChild("ItemHandler", 10)
-		end
-		log("remotes — ItemHandler: " .. tostring(not not ItemHandler))
-	end)
-	task.spawn(function()
-		meleeEvent = rs:FindFirstChild("meleeEvent") or rs:WaitForChild("meleeEvent", 15)
-	end)
-	task.spawn(function()
-		shootingEvent = rs:FindFirstChild("ShootEvent") or rs:WaitForChild("ShootEvent", 15)
-	end)
-	task.spawn(function()
-		reloadEvent = rs:FindFirstChild("ReloadEvent") or rs:WaitForChild("ReloadEvent", 15)
-		soundEvent  = rs:FindFirstChild("SoundEvent")
-	end)
-end
-task.spawn(resolveRemotesAsync)
-
-local function rebindRemotes(timeout)
-	local folder = remoteFolder() or workspace:WaitForChild("Remote", timeout or 6)
-	if folder then ItemHandler = folder:FindFirstChild("ItemHandler") or ItemHandler end
-	meleeEvent    = meleeEvent or rs:FindFirstChild("meleeEvent")
-	shootingEvent = shootingEvent or rs:FindFirstChild("ShootEvent")
-	reloadEvent   = reloadEvent or rs:FindFirstChild("ReloadEvent")
-	local found = {
-		melee  = not not meleeEvent,
-		shoot  = not not shootingEvent,
-		reload = not not reloadEvent,
-		item   = not not ItemHandler,
-		arrest = not not getRemote("arrest"),
-	}
-	log("rebind — melee=" .. tostring(found.melee)
-		.. " shoot=" .. tostring(found.shoot)
-		.. " reload=" .. tostring(found.reload)
-		.. " item=" .. tostring(found.item)
-		.. " arrest=" .. tostring(found.arrest))
-	return found
-end
-
-local function prisonTable()
-	return workspace:FindFirstChild("Prison_ITEMS")
-end
-
-local function getItemIn(subfolder, itemName, childName)
-	local t = prisonTable()
-	if not t then return nil end
-	local folder = t:FindFirstChild(subfolder)
-	if not folder then return nil end
-	local entry = folder:FindFirstChild(itemName)
-	if not entry then return nil end
-	if childName then
-		return entry:FindFirstChild(childName)
-			or entry:FindFirstChild("ITEMPICKUP")
-			or entry:FindFirstChildWhichIsA("BasePart")
-	end
-	return entry
-end
-
-local function findItemAnywhere(itemName)
-	local t = prisonTable()
-	if not t then return nil end
-	-- Prefer giver folder first, then single, then recursive search
-	local giver = t:FindFirstChild("giver")
-	if giver and giver:FindFirstChild(itemName) then
-		return giver:FindFirstChild(itemName)
-	end
-	local single = t:FindFirstChild("single")
-	if single and single:FindFirstChild(itemName) then
-		return single:FindFirstChild(itemName)
-	end
-	return t:FindFirstChild(itemName, true)
-end
-
-local function findPickupPart(itemModelOrPart)
-	if not itemModelOrPart then return nil end
-	if itemModelOrPart:IsA("BasePart") then return itemModelOrPart end
-	return itemModelOrPart:FindFirstChild("ITEMPICKUP", true)
-		or itemModelOrPart:FindFirstChildWhichIsA("BasePart", true)
-end
-
--- ============================================================================
--- TEAM LOOKUPS & CHECKS
---   Bright blue = Guards · Bright orange = Inmates · Bright red = Criminals
--- ============================================================================
-local function teamColor(plr)
-	local ok, col = pcall(function() return plr.TeamColor end)
-	if not ok or not col then return "White" end
-	return tostring(col.Name)
-end
-local function isGuard(plr)  return teamColor(plr) == "Bright blue"   end
-local function isInmate(plr) return teamColor(plr) == "Bright orange" end
-local function isCrim(plr)   return teamColor(plr) == "Bright red"    end
-
-local function selTarget(plr, cfgKey)
-	local want = CONFIG[cfgKey] or "All"
-	if want == "All" then return true end
-	if want == "Guards" then return isGuard(plr) end
-	if want == "Inmates" then return isInmate(plr) end
-	if want == "Criminals" then return isCrim(plr) end
-	if want == "Non-Friends" then
-		local ok, fr = pcall(function() return lp:IsFriendsWith(plr.UserId) end)
-		return not (ok and fr)
-	end
-	return true
-end
-
-local function isCuffed(target)
-	local ch = target and target.Character
-	if not ch then return false end
-	local head = ch:FindFirstChild("Head")
-	return (head and head:FindFirstChild("handcuffedGui")) ~= nil
-end
-
-local function arrestables()
-	local out = {}
-	for _, plr in ipairs(plrs:GetPlayers()) do
-		if plr ~= lp and not isGuard(plr) then
-			local ch = plr.Character
-			local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-			if ch and charRoot(plr) and hum and hum.Health > 0 and not isCuffed(plr) then
-				table.insert(out, plr)
-			end
-		end
-	end
-	return out
-end
-
--- ============================================================================
--- SMART ITEM HANDLER (BYPASSES LATEST PRISON LIFE DISTANCE CHECKS)
--- ============================================================================
-local pullingLock = false
-
-local function invokeItemHandlerSmart(targetModelOrPart, label)
-	if not ItemHandler then
-		local folder = remoteFolder()
-		if folder then
-			ItemHandler = folder:FindFirstChild("ItemHandler") or folder:WaitForChild("ItemHandler", 4)
-		end
-	end
-	if not ItemHandler then
-		log("ItemHandler missing on this server", true)
-		return false
-	end
-	if not targetModelOrPart then return false end
-
-	pace()
-
-	local pickupPart = findPickupPart(targetModelOrPart)
-	local modelTarget = targetModelOrPart:IsA("Model") and targetModelOrPart
-		or (pickupPart and pickupPart.Parent) or targetModelOrPart
-	local myRoot = charRoot()
-	local method = CONFIG.pickupMethod or "Smart Snap + Spoof"
-
-	-- 1) Remote Spoof Only
-	if method == "Remote Spoof Only" or not myRoot or not pickupPart then
-		local pivot = myRoot and myRoot.CFrame or CFrame.new(0, 100, 0)
-		local ok = vsafe(function()
-			ItemHandler:InvokeServer(pickupPart or targetModelOrPart)
-		end)
-		if not ok then
-			ok = vsafe(function()
-				ItemHandler:InvokeServer({ Position = pivot, Parent = modelTarget })
-			end)
-		end
-		if ok then
-			state.itemCount = state.itemCount + 1
-			log("granted (spoof): " .. tostring(label or modelTarget.Name))
-		end
-		return ok
-	end
-
-	-- 2) Smart Snap + Spoof / CFrame Snap-Back (Bypasses server distance check!)
-	local dist = (pickupPart.Position - myRoot.Position).Magnitude
-	local needSnap = (method == "CFrame Snap-Back") or (dist > 13)
-
-	while pullingLock do task.wait(0.03) end
-	pullingLock = true
-
-	local savedCF = myRoot.CFrame
-	local savedCamCF = currentCam() and currentCam().CFrame
-	local ok = false
-
-	pcall(function()
-		if needSnap and myRoot and myRoot.Parent then
-			myRoot.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-			myRoot.CFrame = pickupPart.CFrame * CFrame.new(0, 2.2, 0)
-			task.wait(0.07)
-		end
-
-		-- Invoke with literal ITEMPICKUP BasePart first (what standard & updated PL servers expect)
-		local s1 = pcall(function()
-			ItemHandler:InvokeServer(pickupPart)
-		end)
-		-- Also invoke with table format for hybrid/custom PL servers
-		if not s1 then
-			s1 = pcall(function()
-				ItemHandler:InvokeServer({
-					Position = pickupPart.CFrame,
-					Parent = modelTarget,
-				})
-			end)
-		end
-		ok = s1
-		task.wait(0.04)
-	end)
-
-	-- Restore player back to exact starting spot
-	pcall(function()
-		local r = charRoot()
-		if needSnap and r and savedCF then
-			r.CFrame = savedCF
-			r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-			if savedCamCF and currentCam() then
-				currentCam().CFrame = savedCamCF
-			end
-		end
-	end)
-
-	pullingLock = false
-
-	if ok then
-		state.itemCount = state.itemCount + 1
-		log("granted: " .. tostring(label or modelTarget.Name))
-	end
-	return ok
-end
-
-local function giveAnywhere(itemName)
-	local target = findItemAnywhere(itemName)
-	if not target then
-		log("item not currently on map: " .. tostring(itemName), true)
-		return false
-	end
-	return invokeItemHandlerSmart(target, itemName)
-end
-
-local function giveLegacy(itemName, subfolder)
-	local child = getItemIn(subfolder or "giver", itemName, "ITEMPICKUP")
-		or getItemIn("single", itemName, "ITEMPICKUP")
-		or getItemIn(subfolder or "giver", itemName)
-	if not child then
-		log("giver not found for " .. tostring(itemName), true)
-		return false
-	end
-	return invokeItemHandlerSmart(child, itemName)
-end
-
-local GIVEN_GUNS  = { "Remington 870", "AK-47", "M9", "M4A1" }
-local GIVEN_MELEE = { "Key card", "Hammer", "Crude Knife" }
-
-local function modAllGuns() end -- forward declaration; bound in Gun Engine below
-
-local function giveAllLoot(autoMod)
-	task.spawn(function()
-		log("pulling full weapon kit...")
-		local savedRoot = charRoot() and charRoot().CFrame
-		for _, g in ipairs(GIVEN_GUNS) do
-			if state.detached then return end
-			local item = findItemAnywhere(g)
-			if item then invokeItemHandlerSmart(item, g) end
-		end
-		for _, m in ipairs(GIVEN_MELEE) do
-			if state.detached then return end
-			local item = findItemAnywhere(m)
-			if item then invokeItemHandlerSmart(item, m) end
-		end
-		local shield = findItemAnywhere("Riot Shield")
-		if shield then invokeItemHandlerSmart(shield, "Riot Shield") end
-		if savedRoot and charRoot() then
-			pcall(function() charRoot().CFrame = savedRoot end)
-		end
-		if autoMod then
-			task.wait(0.25)
-			modAllGuns()
-		end
-		toast("Full Kit Granted", "All catalogued weapons pulled to backpack", 2.5, "ok")
-	end)
-end
-
-local function giveRiotGear()
-	task.spawn(function()
-		giveAnywhere("Riot Shield")
-		local hat = getItemIn("hats", "Riot helmet", "hat") or getItemIn("hats", "Police hat", "hat")
-		if hat then invokeItemHandlerSmart(hat, "Riot Helmet") end
-		local mask = getItemIn("hats", "Ski mask", "hat")
-		if mask then invokeItemHandlerSmart(mask, "Ski Mask") end
-		toast("Riot Gear", "Shield & headgear requested", 2, "ok")
-	end)
-end
-
--- ============================================================================
--- GUN ENGINE — TRUE SHOOTEVENT + RELOADEVENT + GUNSTATES MODDING
--- ============================================================================
-local function gunState(tool)
-	if not (tool and tool:FindFirstChild("GunStates")) then return nil end
-	local gs
-	pcall(function() gs = require(tool.GunStates) end)
-	return gs
-end
-
-local function findGunTool(preferredName)
-	local function sweep(container)
-		if not container then return nil end
-		if preferredName then
-			local t = container:FindFirstChild(preferredName)
-			if t and t:IsA("Tool") and t:FindFirstChild("GunStates") then return t end
-		end
-		for _, t in ipairs(container:GetChildren()) do
-			if t:IsA("Tool") and t:FindFirstChild("GunStates") and t.Name ~= "Taser" then
-				return t
-			end
-		end
-		return nil
-	end
-	return sweep(lp.Character) or sweep(lp.Backpack)
-end
-
-local function ensureGunTool(waitBudget)
-	local tool = findGunTool(CONFIG.gunChoice) or findGunTool()
-	if tool then return tool end
-	if giveAnywhere(CONFIG.gunChoice) or giveAnywhere("Remington 870") or giveAnywhere("M9") then
-		for _ = 1, math.max(waitBudget or 6, 1) do
-			task.wait(0.15)
-			if state.detached then return nil end
-			tool = findGunTool(CONFIG.gunChoice) or findGunTool()
-			if tool then return tool end
-		end
-	end
-	return nil
-end
-
--- Equips the gun onto LocalPlayer.Character if it's currently in Backpack
--- (Prison Life's server checks tool.Parent == Character on ShootEvent!)
-local function equipToolFast(tool)
-	if not tool or not lp.Character then return false end
-	if tool.Parent == lp.Character then return true end
-	pcall(function()
-		local hum = charHumanoid()
-		if hum then
-			hum:EquipTool(tool)
-		else
-			tool.Parent = lp.Character
-		end
-	end)
-	return tool.Parent == lp.Character
-end
-
--- Exact bullet payload validated by Prison Life's server GunServer script:
--- MUST include ["Hit"] = targetPart (as well as Cframe, RayObject, Distance)
-local function buildBullets(targetPart, count)
-	local bullets = {}
-	local myPos = (charHead() and charHead().Position)
-		or (charRoot() and charRoot().Position)
-		or Vector3.new(0, 100, 0)
-	local targetPos = targetPart and targetPart.Position or Vector3.new(0, 100, 0)
-	local diff = targetPos - myPos
-	local dist = math.max(diff.Magnitude, 1)
-	local dir = diff.Unit * math.max(dist + 10, 100)
-
-	for i = 1, count or 1 do
-		bullets[i] = {
-			["RayObject"] = Ray.new(myPos, dir),
-			["Distance"]  = dist,
-			["Cframe"]    = targetPart and targetPart.CFrame or CFrame.new(),
-			["Hit"]       = targetPart, -- Primary key read by Prison Life server script!
-			["HitPart"]   = targetPart, -- Compatibility key for modded servers
-			["Color"]     = Color3.fromRGB(255, 255, 0),
-		}
-	end
-	return bullets
-end
-
-local function reloadToolServer(tool)
-	if not tool then return end
-	if not reloadEvent then reloadEvent = rs:FindFirstChild("ReloadEvent") end
-	if reloadEvent then
-		pcall(function() reloadEvent:FireServer(tool) end)
-	end
-end
-
-local function bulletKill(plr, tool, count)
-	if not shootingEvent then
-		shootingEvent = rs:FindFirstChild("ShootEvent")
-		if not shootingEvent then return false end
-	end
-	local ch = plr and plr.Character
-	if not ch then return false end
-	if not (tool and tool:FindFirstChild("GunStates")) then return false end
-
-	-- Strip Riot Shield if Anti-Shield is enabled so rays/hits never get blocked
-	if CONFIG.antiShield then
-		pcall(function()
-			local sh = ch:FindFirstChild("Riot Shield")
-			if sh then sh:Destroy() end
-		end)
-	end
-
-	local part = ch:FindFirstChild("Head")
-		or ch:FindFirstChild("Torso")
-		or ch:FindFirstChild("UpperTorso")
-		or ch:FindFirstChild("HumanoidRootPart")
-	if not part then return false end
-
-	equipToolFast(tool)
-	local bullets = buildBullets(part, count or CONFIG.gunBulletsPerCall)
-	local ok = vsafe(function()
-		shootingEvent:FireServer(bullets, tool)
-	end)
-	reloadToolServer(tool)
-	return ok
-end
-
-local function modGun(tool)
-	if not (tool and tool:IsA("Tool") and tool:FindFirstChild("GunStates")) then
-		return false
-	end
-	local ok = pcall(function()
-		local gs = require(tool.GunStates)
-		gs.Damage      = CONFIG.gunDamage
-		gs.Bullets     = CONFIG.gunBullets
-		gs.FireRate    = math.max(CONFIG.gunFireRate, 0.0001)
-		gs.Spread      = CONFIG.gunSpread
-		gs.ReloadTime  = 0.0001
-		gs.AutoFire    = CONFIG.gunAutoFire
-		gs.Range       = 9999
-		gs.MaxAmmo     = math.max(gs.MaxAmmo or 0, 9999)
-		gs.StoredAmmo  = 999999
-		if CONFIG.gunInfiniteAmmo then
-			gs.CurrentAmmo = math.huge
-		else
-			gs.CurrentAmmo = gs.MaxAmmo
-		end
-	end)
-	if not ok then
-		-- Fallback via getgc/debug.setupvalue if GunStates table is read-only
-		log("GunStates write failed on " .. tostring(tool.Name), true)
-		return false
-	end
-	reloadToolServer(tool)
-	log("modded " .. tool.Name)
-	return true
-end
-
-modAllGuns = function()
-	task.spawn(function()
-		local hits = 0
-		local function sweep(container)
-			if not container then return end
-			for _, tool in ipairs(container:GetChildren()) do
-				if tool:IsA("Tool") and tool:FindFirstChild("GunStates") then
-					if modGun(tool) then hits = hits + 1 end
-				end
-			end
-		end
-		sweep(lp.Backpack)
-		sweep(lp.Character)
-		log("gun mods applied to " .. hits .. " weapon(s)")
-		if hits > 0 then
-			toast("Guns Modded", "Applied stats to " .. hits .. " weapon(s)", 2, "ok")
-		end
-	end)
-end
-
-local function modNamed(name)
-	task.spawn(function()
-		local tool = (lp.Character and lp.Character:FindFirstChild(name))
-			or (lp.Backpack and lp.Backpack:FindFirstChild(name))
-		if not tool and name ~= "Taser" then
-			giveAnywhere(name)
-			for _ = 1, 10 do
-				task.wait(0.15)
-				tool = (lp.Character and lp.Character:FindFirstChild(name))
-					or (lp.Backpack and lp.Backpack:FindFirstChild(name))
-				if tool then break end
-			end
-		end
-		if tool then
-			modGun(tool)
-			toast("Gun Modded", name .. " upgraded", 2, "ok")
-		else
-			log(name .. " not in inventory", true)
-		end
-	end)
-end
-
--- ============================================================================
--- COMBAT CORES — MELEE / TP-PUNCH / GUN KILL / TAZE / ARREST
--- ============================================================================
--- Standard in-range melee burst (fires all hits in 1 frame for instant KO)
-local function meleeBurst(plr, hits)
-	if not meleeEvent then
-		meleeEvent = rs:FindFirstChild("meleeEvent")
-		if not meleeEvent then return false end
-	end
-	local hum = charHumanoid(plr)
-	if not (hum and hum.Health > 0) then return false end
-	local count = hits or CONFIG.meleeBurstHits
-	for _ = 1, count do
-		if state.detached then return false end
-		pcall(function() meleeEvent:FireServer(plr) end)
-	end
-	state.killCounter = state.killCounter + 1
-	return true
-end
-
--- TP-Punch Kill: Snaps within melee range of target, fires 15 meleeEvent hits
--- in one frame (instant 100->0 kill with NO weapon required), and snaps back!
-local function tpPunchKill(plr, skipReturn)
-	if not meleeEvent then
-		meleeEvent = rs:FindFirstChild("meleeEvent")
-		if not meleeEvent then return false end
-	end
-	local myRoot = charRoot()
-	local theirRoot = charRoot(plr)
-	local hum = charHumanoid(plr)
-	if not (myRoot and theirRoot and hum and hum.Health > 0) then return false end
-	local ff = plr.Character and plr.Character:FindFirstChildOfClass("ForceField")
-	if ff and CONFIG.killAuraIgnoreFF then return false end
-
-	local savedCF = myRoot.CFrame
-	myRoot.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-	myRoot.CFrame = theirRoot.CFrame * CFrame.new(0, 0, 2.2)
-	task.wait(0.06)
-
-	for _ = 1, 15 do
-		pcall(function() meleeEvent:FireServer(plr) end)
-	end
-	state.killCounter = state.killCounter + 1
-	task.wait(0.03)
-
-	if not skipReturn and charRoot() then
-		pcall(function()
-			charRoot().CFrame = savedCF
-			charRoot().AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-		end)
-	end
-	return true
-end
-
--- Super Punch: Instantly punches everyone within 15 studs 15 times (1-hit KO)
-local function triggerSuperPunch()
-	local myRoot = charRoot()
-	if not myRoot then return end
-	local hitCount = 0
-	for _, plr in ipairs(plrs:GetPlayers()) do
-		if plr ~= lp and plr.Character then
-			local theirRoot = charRoot(plr)
-			local hum = charHumanoid(plr)
-			if theirRoot and hum and hum.Health > 0 then
-				if (theirRoot.Position - myRoot.Position).Magnitude <= 16 then
-					meleeBurst(plr, 15)
-					hitCount = hitCount + 1
-				end
-			end
-		end
-	end
-	if hitCount > 0 then
-		log("super punch KO'd " .. hitCount .. " target(s)")
-	end
-end
-
-local function gunKill(plr)
-	local tool = findGunTool(CONFIG.gunChoice)
-		or findGunTool()
-		or ensureGunTool(4)
-	if not tool then return false end
-	pcall(function()
-		local gs = gunState(tool)
-		if gs and (gs.Damage or 0) < CONFIG.gunDamage then
-			modGun(tool)
-		end
-	end)
-	-- Fire 2 bursts of 10 bullets to guarantee instant death even on 100 HP + Riot Shield
-	local ok = bulletKill(plr, tool, math.max(CONFIG.gunBulletsPerCall, 10))
-	if ok then
-		bulletKill(plr, tool, 6)
-		state.killCounter = state.killCounter + 1
-	end
-	return ok
-end
-
-local function killTarget(plr)
-	if not (plr and plr.Character) then return false end
-	local hum = charHumanoid(plr)
-	if not (hum and hum.Health > 0) then return false end
-	local ff = plr.Character:FindFirstChildOfClass("ForceField")
-	if ff and CONFIG.killAuraIgnoreFF then return false end
-
-	local myRoot = charRoot()
-	local theirRoot = charRoot(plr)
-	local dist = (myRoot and theirRoot) and (theirRoot.Position - myRoot.Position).Magnitude or 999
-
-	local mode = CONFIG.killAuraMode
-	if mode == "Fists" then
-		if dist <= 15 then
-			return meleeBurst(plr, CONFIG.meleeBurstHits)
-		else
-			return tpPunchKill(plr)
-		end
-	elseif mode == "Gun" then
-		if gunKill(plr) then return true end
-		return (dist <= 15) and meleeBurst(plr, CONFIG.meleeBurstHits) or tpPunchKill(plr)
-	else
-		-- "Smart (Gun + Fists)": Instant melee burst if close, Gun if holding/have gun, else TP-Punch
-		if dist <= 14 then
-			meleeBurst(plr, CONFIG.meleeBurstHits)
-		end
-		local tool = findGunTool(CONFIG.gunChoice) or findGunTool()
-		if tool then
-			return bulletKill(plr, tool, math.max(CONFIG.gunBulletsPerCall, 10))
-		elseif dist > 14 then
-			return tpPunchKill(plr)
-		end
-		return true
-	end
-end
-
-local function killAll(kind)
-	task.spawn(function()
-		local mode = kind or CONFIG.killAuraMode
-		local myRoot = charRoot()
-		local savedCF = myRoot and myRoot.CFrame
-
-		local tool = nil
-		if mode ~= "Fists" then
-			tool = findGunTool(CONFIG.gunChoice) or findGunTool() or ensureGunTool(4)
-		end
-
-		local killed = 0
-		for _, plr in ipairs(plrs:GetPlayers()) do
-			if state.detached then return end
-			if plr ~= lp and plr.Character and selTarget(plr, "auraTargets") then
-				local hum = charHumanoid(plr)
-				local ff = plr.Character:FindFirstChildOfClass("ForceField")
-				if hum and hum.Health > 0 and not (ff and CONFIG.killAuraIgnoreFF) then
-					if tool and mode ~= "Fists" then
-						bulletKill(plr, tool, 12)
-						killed = killed + 1
-						state.killCounter = state.killCounter + 1
-						task.wait(0.05)
-					else
-						tpPunchKill(plr, true)
-						killed = killed + 1
-					end
-				end
-			end
-		end
-
-		if savedCF and charRoot() then
-			pcall(function()
-				charRoot().CFrame = savedCF
-				charRoot().AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-			end)
-		end
-		log("kill-all finished (" .. killed .. " targets attacked)")
-		toast("Kill All", "Attacked " .. killed .. " player(s)", 2, "ok")
-	end)
-end
-
--- ============================================================================
--- TAZE & ARREST ENGINE
--- ============================================================================
-local function getTaser()
-	return (lp.Character and lp.Character:FindFirstChild("Taser"))
-		or (lp.Backpack and lp.Backpack:FindFirstChild("Taser"))
-end
-
-local function tazeTarget(plr, taserTool)
-	if not shootingEvent then return false end
-	taserTool = taserTool or getTaser()
-	if not taserTool then return false end
-	local part = charTorso(plr) or charHead(plr)
-	if not part then return false end
-	equipToolFast(taserTool)
-	local bullets = buildBullets(part, 1)
-	local ok = vsafe(function()
-		shootingEvent:FireServer(bullets, taserTool)
-	end)
-	reloadToolServer(taserTool)
-	return ok
-end
-
-local function tazeAll()
-	task.spawn(function()
-		local taser = getTaser()
-		if not taser then
-			toast("No Taser", "Become a Guard first to receive a Taser", 2.5, "err")
-			log("Taser missing — switch to Guard team first", true)
-			return
-		end
-		local count = 0
-		for _, plr in ipairs(plrs:GetPlayers()) do
-			if state.detached then return end
-			if plr ~= lp and not isGuard(plr) and charHumanoid(plr) and charHumanoid(plr).Health > 0 then
-				tazeTarget(plr, taser)
-				count = count + 1
-				task.wait(0.06)
-			end
-		end
-		log("tazed " .. count .. " player(s)")
-		toast("Taze All", "Shocked " .. count .. " player(s)", 2, "ok")
-	end)
-end
-
-local function getArrestRemote()
-	return getRemote("arrest") or getRemote("Arrest")
-end
-
--- Prison Life's server arrest RemoteFunction checks distance to Torso
-local function arrestOnce(target)
-	local remote = getArrestRemote()
-	if not remote then return false end
-	local theirTorso = charTorso(target)
-	if not theirTorso then return false end
-	if CONFIG.arrestSnap then
-		local myRoot = charRoot()
-		if myRoot then
-			myRoot.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-			myRoot.CFrame = theirTorso.CFrame * CFrame.new(0, 0, 1.5)
-		end
-	end
-	vsafe(function() remote:InvokeServer(theirTorso) end)
-	return true
-end
-
-local function arrestTarget(target, skipReturn)
-	if not target or target == lp then return false end
-	local myRoot = charRoot()
-	local savedCF = myRoot and myRoot.CFrame
-	local cuffed = false
-	for _ = 1, 10 do
-		if state.detached then break end
-		if not charHumanoid(target) or charHumanoid(target).Health <= 0 then break end
-		arrestOnce(target)
-		task.wait(0.07)
-		if isCuffed(target) then
-			cuffed = true
-			break
-		end
-	end
-	if not skipReturn and savedCF and charRoot() then
-		pcall(function()
-			charRoot().CFrame = savedCF
-			charRoot().AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-		end)
-	end
-	return cuffed
-end
-
-local function arrestAll()
-	task.spawn(function()
-		local myRoot = charRoot()
-		local savedCF = myRoot and myRoot.CFrame
-		local n = 0
-		for _, plr in ipairs(arrestables()) do
-			if state.detached then return end
-			if arrestTarget(plr, true) then n = n + 1 end
-			task.wait(0.15)
-		end
-		if savedCF and charRoot() then
-			pcall(function()
-				charRoot().CFrame = savedCF
-				charRoot().AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-			end)
-		end
-		state.arrestCount = state.arrestCount + n
-		log("arrest-all cuffed " .. n .. " player(s)")
-		toast("Arrest All", "Cuffed " .. n .. " player(s)", 2, "ok")
-	end)
-end
-
--- ============================================================================
--- VELOCITY FLING ENGINE (SKIDFLING / PHYSICS LAUNCHER)
--- ============================================================================
-local function flingTarget(target, duration)
-	if state.flinging then return end
-	local myCh = lp.Character
-	local myRoot = charRoot()
-	local myHum = charHumanoid()
-	local theirRoot = charRoot(target)
-	if not (myCh and myRoot and myHum and theirRoot) then
-		toast("Fling Failed", "Target has no root part", 2, "err")
-		return
-	end
-
-	state.flinging = true
-	local savedCF = myRoot.CFrame
-	local oldFall = workspace.FallenPartsDestroyHeight
-	pcall(function() workspace.FallenPartsDestroyHeight = 0 / 0 end)
-
-	local bv = Instance.new("BodyVelocity")
-	bv.Name = "RiotHub_FlingBV"
-	bv.Velocity = Vector3.new(9e7, 9e7, 9e7)
-	bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
-	bv.Parent = myRoot
-
-	myHum:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
-
-	local startT = tick()
-	local maxDur = duration or 1.6
-	local angle = 0
-
-	while tick() - startT < maxDur and not state.detached do
-		local tRoot = charRoot(target)
-		local tHum = charHumanoid(target)
-		if not tRoot or not tHum or tHum.Health <= 0 then break end
-		-- Stop early once target is launched away at high speed
-		if tRoot.Velocity.Magnitude > 450 then break end
-
-		angle = angle + 100
-		local pred = tRoot.Velocity * 0.12
-		myRoot.CFrame = CFrame.new(tRoot.Position + pred) * CFrame.Angles(math.rad(angle), math.rad(angle), 0)
-		myRoot.Velocity = Vector3.new(9e7, 9e7, 9e7)
-		myRoot.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
-		runSvc.Heartbeat:Wait()
-	end
-
-	pcall(function() bv:Destroy() end)
-	pcall(function() myHum:SetStateEnabled(Enum.HumanoidStateType.Seated, true) end)
-	pcall(function() workspace.FallenPartsDestroyHeight = oldFall end)
-
-	-- Stabilize local character back at original position
-	if charRoot() and savedCF then
-		for _ = 1, 8 do
-			local r = charRoot()
-			if not r then break end
-			r.CFrame = savedCF
-			r.Velocity = Vector3.new(0, 0, 0)
-			r.RotVelocity = Vector3.new(0, 0, 0)
-			r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-			r.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
-			runSvc.Heartbeat:Wait()
-		end
-	end
-
-	state.flinging = false
-	log("flung " .. tostring(target.Name))
-end
-
-local function flingAll()
-	task.spawn(function()
-		for _, plr in ipairs(plrs:GetPlayers()) do
-			if state.detached then return end
-			if plr ~= lp and charRoot(plr) and charHumanoid(plr) and charHumanoid(plr).Health > 0 then
-				local ff = plr.Character and plr.Character:FindFirstChildOfClass("ForceField")
-				if not ff then
-					flingTarget(plr, 1.1)
-					task.wait(0.15)
-				end
-			end
-		end
-		toast("Fling All", "Finished flinging server", 2, "ok")
-	end)
-end
-
--- ============================================================================
--- VEHICLE SPAWNER & CAR MODS
--- ============================================================================
-local function getSeatedVehicle()
-	local hum = charHumanoid()
-	local seat = hum and hum.SeatPart
-	if seat and seat:IsA("VehicleSeat") then
-		return seat:FindFirstAncestorOfClass("Model"), seat
-	end
-	return nil, nil
-end
-
-local function spawnCarHere(preferredType)
-	task.spawn(function()
-		local myRoot = charRoot()
-		if not myRoot then return end
-		local savedCF = myRoot.CFrame
-
-		local buttons = prisonTable() and prisonTable():FindFirstChild("buttons")
-		if not buttons then
-			log("Prison_ITEMS.buttons not found", true)
-			return
-		end
-
-		local chosenBtn = nil
-		for _, ch in ipairs(buttons:GetChildren()) do
-			if ch.Name == "Car Spawner" then
-				local part = ch:FindFirstChild("Car Spawner") or ch:FindFirstChildWhichIsA("BasePart")
-				if part then
-					chosenBtn = part
-					if preferredType == "Police" and (part.Position - Vector3.new(616, 98, 2490)).Magnitude < 250 then
-						break
-					elseif preferredType == "Sedan" and (part.Position - Vector3.new(-910, 95, 2060)).Magnitude < 350 then
-						break
-					end
-				end
-			end
-		end
-
-		if not chosenBtn then
-			toast("Car Spawner", "No Car Spawner button found on map", 2, "err")
-			return
-		end
-
-		local carContainer = workspace:FindFirstChild("CarContainer")
-		local existing = {}
-		if carContainer then
-			for _, c in ipairs(carContainer:GetChildren()) do
-				existing[c] = true
-			end
-		end
-
-		invokeItemHandlerSmart(chosenBtn, "Car Spawner")
-		task.wait(0.35)
-
-		local newCar = nil
-		if carContainer then
-			for _, c in ipairs(carContainer:GetChildren()) do
-				if not existing[c] then
-					newCar = c
-					break
-				end
-			end
-			if not newCar then
-				local children = carContainer:GetChildren()
-				newCar = children[#children]
-			end
-		end
-
-		if newCar then
-			pcall(function()
-				if charRoot() then charRoot().CFrame = savedCF end
-				newCar:PivotTo(savedCF * CFrame.new(0, 3.5, 0))
-				local seat = newCar:FindFirstChildWhichIsA("VehicleSeat", true)
-				if seat and charHumanoid() then
-					seat:Sit(charHumanoid())
-				end
-			end)
-			toast("Car Spawned", "Vehicle brought to your position!", 2, "ok")
-			log("spawned & brought vehicle: " .. tostring(newCar.Name))
-		else
-			toast("Car Triggered", "Car spawned at pad", 2, "ok")
-		end
-	end)
-end
-
-local function modCurrentCar()
-	local car, seat = getSeatedVehicle()
-	if not seat then
-		toast("Sit in a Car", "Sit in a vehicle driver seat first", 2, "err")
-		return
-	end
-	pcall(function()
-		seat.MaxSpeed = 60 * CONFIG.carSpeedMult
-		seat.Torque = 40000 * CONFIG.carSpeedMult
-		seat.TurnSpeed = 4
-	end)
-	toast("Car Modded", string.format("Speed %.1fx applied!", CONFIG.carSpeedMult), 2, "ok")
-end
-
--- ============================================================================
--- WORLD — GATE / REVERSIBLE DOORS & FENCES / ANTI-CRIM PAD
--- ============================================================================
-local function openGate()
-	task.spawn(function()
-		local gateBtn = getItemIn("buttons", "Prison Gate", "Prison Gate")
-		if not gateBtn then
-			log("Prison Gate button not found", true)
-			return
-		end
-		local ok = invokeItemHandlerSmart(gateBtn, "Prison Gate")
-		if ok then
-			toast("Gate Opened", "Prison main gate triggered", 1.8, "ok")
-		end
-	end)
-end
-
-local function ensureHiddenWorld()
-	if state.hiddenWorld and state.hiddenWorld.Parent then
-		return state.hiddenWorld
-	end
-	local f = rs:FindFirstChild("RiotHub_HiddenWorld")
-	if not f then
-		f = Instance.new("Folder")
-		f.Name = "RiotHub_HiddenWorld"
-		f.Parent = rs
-	end
-	state.hiddenWorld = f
-	return f
-end
-
-local function setDoorsRemoved(remove)
-	local store = ensureHiddenWorld()
-	if remove then
-		local count = 0
-		for _, name in ipairs({ "Doors", "Prison_Fences", "Cellblock_Doors" }) do
-			local obj = workspace:FindFirstChild(name)
-			if obj then
-				pcall(function() obj.Parent = store end)
-				count = count + 1
-			end
-		end
-		-- Also strip cell bars if present inside Prison_Cellblock
-		local cb = workspace:FindFirstChild("Prison_Cellblock")
-		if cb and cb:FindFirstChild("doors") then
-			pcall(function() cb.doors.Parent = store end)
-			count = count + 1
-		end
-		log("stashed " .. count .. " door/fence folder(s) (reversible)")
-		toast("Doors & Fences", "Removed! Toggle OFF anytime to restore", 2, "ok")
-	else
-		local count = 0
-		for _, obj in ipairs(store:GetChildren()) do
-			pcall(function()
-				if obj.Name == "doors" and workspace:FindFirstChild("Prison_Cellblock") then
-					obj.Parent = workspace.Prison_Cellblock
-				else
-					obj.Parent = workspace
-				end
-				count = count + 1
-			end)
-		end
-		log("restored " .. count .. " door/fence folder(s)")
-		toast("Doors Restored", "All doors and fences returned", 2, "ok")
-	end
-end
-
-local savedTouchInterests = {}
-local function setAntiCrimPad(on)
-	pcall(function()
-		local crimSpawn = workspace:FindFirstChild("Criminals Spawn")
-		if not crimSpawn then return end
-		if on then
-			for _, d in ipairs(crimSpawn:GetDescendants()) do
-				if d:IsA("TouchTransmitter") then
-					table.insert(savedTouchInterests, { obj = d, parent = d.Parent })
-					d.Parent = nil
-				end
-			end
-			toast("Anti-Crim Pad", "Guards can now enter Criminal Base safely!", 2, "ok")
-		else
-			for _, item in ipairs(savedTouchInterests) do
-				if item.obj and item.parent then
-					pcall(function() item.obj.Parent = item.parent end)
-				end
-			end
-			savedTouchInterests = {}
-		end
-	end)
-end
-
--- ============================================================================
--- TEAM SWITCHING & INSTANT REFRESH (RE)
--- ============================================================================
-local function switchTeam(kind, preservePos)
-	task.spawn(function()
-		local myRoot = charRoot()
-		local savedCF = preservePos and myRoot and myRoot.CFrame
-		local teamR = getRemote("TeamEvent")
-		local loadChar = getRemote("loadchar")
-
-		if kind == "Inmate" then
-			if teamR then vsafe(function() teamR:FireServer("Bright orange") end) end
-			task.wait(0.1)
-			if loadChar then vsafe(function() loadChar:InvokeServer(lp.Name) end) end
-		elseif kind == "Guard" then
-			if teamR then vsafe(function() teamR:FireServer("Bright blue") end) end
-			task.wait(0.1)
-			if loadChar then vsafe(function() loadChar:InvokeServer(lp.Name) end) end
-		elseif kind == "Neutral" then
-			if teamR then vsafe(function() teamR:FireServer("Medium stone grey") end) end
-			if loadChar then vsafe(function() loadChar:InvokeServer(lp.Name, "Medium stone grey") end) end
-		elseif kind == "Criminal" then
-			local crimSpawn = workspace:FindFirstChild("Criminals Spawn")
-			local pad = crimSpawn and (crimSpawn:FindFirstChildWhichIsA("SpawnLocation", true)
-				or crimSpawn:FindFirstChildWhichIsA("BasePart", true))
-			local padCF = pad and pad.CFrame or CFrame.new(-920.5, 95.3, 2138.3)
-			if myRoot then
-				myRoot.CFrame = padCF + Vector3.new(0, 2.5, 0)
-				task.wait(0.35)
-			end
-		end
-
-		if savedCF then
-			task.wait(0.35)
-			local newRoot = charRoot()
-			if newRoot then
-				pcall(function() newRoot.CFrame = savedCF end)
-			end
-		end
-		log("team -> " .. tostring(kind))
-		toast("Team Switched", "Now on " .. tostring(kind), 2, "ok")
-	end)
-end
-
-local function refreshCharacterInPlace()
-	task.spawn(function()
-		local myRoot = charRoot()
-		local savedCF = myRoot and myRoot.CFrame
-		local savedCam = currentCam() and currentCam().CFrame
-		local loadChar = getRemote("loadchar")
-		if not loadChar then
-			log("loadchar remote unavailable", true)
-			return
-		end
-		vsafe(function() loadChar:InvokeServer(lp.Name) end)
-		local ch = lp.CharacterAdded:Wait()
-		local newRoot = ch:WaitForChild("HumanoidRootPart", 5)
-		task.wait(0.08)
-		if newRoot and savedCF then
-			newRoot.CFrame = savedCF
-			if savedCam and currentCam() then
-				currentCam().CFrame = savedCam
-			end
-		end
-		toast("Character Refreshed", "Respawned at your exact spot", 1.8, "ok")
-	end)
-end
-
--- ============================================================================
--- MOVEMENT, ANTI-TAZE, HITBOX EXPANDER & ORBIT ENGINE
--- ============================================================================
-local orbitAngle = 0
-
-local function applyMovementFrame(dt)
-	local ch = lp.Character
-	if not ch then return end
-	local rootPart = charRoot()
-	local hum = charHumanoid()
-	if not (rootPart and hum) then return end
-
-	-- Save non-cell position periodically for Anti-Arrest return
-	if not isCuffed(lp) and hum.Health > 0 then
-		state.preArrestCF = rootPart.CFrame
-	end
-
-	-- Anti-Arrest: if handcuffedGui appears on Head, instant loadchar & snap back!
-	if CONFIG.antiArrest and isCuffed(lp) then
-		local loadChar = getRemote("loadchar")
-		local returnCF = state.preArrestCF
-		if loadChar then
-			task.spawn(function()
-				vsafe(function() loadChar:InvokeServer(lp.Name) end)
-				task.wait(0.35)
-				if returnCF and charRoot() then
-					pcall(function() charRoot().CFrame = returnCF end)
-				end
-				toast("Anti-Arrest", "Broke handcuffs & restored position!", 2, "ok")
-			end)
-		end
-	end
-
-	-- Anti-Taze / Anti-Stun: restore WalkSpeed, PlatformStand, and Backpack GUI
-	if CONFIG.noStayStunned then
-		if hum.PlatformStand then hum.PlatformStand = false end
-		if hum.Sit and not hum.SeatPart then hum.Sit = false end
-		if hum.WalkSpeed < 16 then
-			hum.WalkSpeed = math.max(CONFIG.walkSpeed, 16)
-			pcall(function() starterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, true) end)
-		end
-	end
-
-	-- Enforce chosen WalkSpeed & JumpPower
-	if CONFIG.walkSpeed ~= 16 and hum.WalkSpeed ~= CONFIG.walkSpeed then
-		hum.WalkSpeed = CONFIG.walkSpeed
-	end
-	if CONFIG.jumpPower ~= 50 then
-		hum.UseJumpPower = true
-		if hum.JumpPower ~= CONFIG.jumpPower then
-			hum.JumpPower = CONFIG.jumpPower
-		end
-	end
-
-	-- TP-Walk
-	if state.toggles.tpWalkOn and hum.MoveDirection.Magnitude > 0.2 then
-		rootPart.CFrame = rootPart.CFrame + hum.MoveDirection * (CONFIG.tpWalkPower * dt * 22)
-	end
-
-	-- Spinbot
-	if state.toggles.spinOn and not state.flinging then
-		rootPart.CFrame = rootPart.CFrame * CFrame.Angles(0, math.rad(CONFIG.spinSpeed * 12) * dt, 0)
-	end
-
-	-- Orbit Selected Target
-	if state.toggles.orbitTargetOn and not state.flinging then
-		local t = getActiveTarget()
-		local tRoot = t and charRoot(t)
-		if tRoot then
-			orbitAngle = orbitAngle + dt * 8
-			local offset = Vector3.new(math.cos(orbitAngle) * 6, 0.5, math.sin(orbitAngle) * 6)
-			rootPart.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-			rootPart.CFrame = CFrame.lookAt(tRoot.Position + offset, tRoot.Position)
-		end
-	end
-
-	-- Character Flight & Car Flight
-	local carModel, carSeat = getSeatedVehicle()
-	if state.toggles.flyOn or (state.toggles.carFlyOn and carSeat) then
-		local camera = currentCam()
-		if camera then
-			local moveDir = Vector3.new(0, 0, 0)
-			if uis:IsKeyDown(Enum.KeyCode.W) then moveDir = moveDir + camera.CFrame.LookVector end
-			if uis:IsKeyDown(Enum.KeyCode.S) then moveDir = moveDir - camera.CFrame.LookVector end
-			if uis:IsKeyDown(Enum.KeyCode.A) then moveDir = moveDir - camera.CFrame.RightVector end
-			if uis:IsKeyDown(Enum.KeyCode.D) then moveDir = moveDir + camera.CFrame.RightVector end
-			local tm = state.touchMove
-			moveDir = moveDir + camera.CFrame.LookVector * (tm.fwd - tm.back)
-			local lift = tm.up - tm.down
-			if uis:IsKeyDown(Enum.KeyCode.E) or uis:IsKeyDown(Enum.KeyCode.Space) then lift = lift + 1 end
-			if uis:IsKeyDown(Enum.KeyCode.Q) or uis:IsKeyDown(Enum.KeyCode.LeftControl) then lift = lift - 1 end
-
-			local spd = (carSeat and CONFIG.carFlySpeed or CONFIG.flySpeed) * 28
-			local delta = (moveDir * spd * dt) + Vector3.new(0, lift * spd * 0.75 * dt, 0)
-
-			if carModel and state.toggles.carFlyOn then
-				pcall(function()
-					carSeat.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-					carModel:PivotTo(carModel:GetPivot() + delta)
-				end)
-			else
-				rootPart.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-				rootPart.CFrame = rootPart.CFrame + delta
-			end
-		end
-	end
-
-	-- Car Noclip
-	if state.toggles.carNoclipOn and carModel then
-		for _, p in ipairs(carModel:GetDescendants()) do
-			if p:IsA("BasePart") and p.CanCollide and p ~= carSeat then
-				state.carNoclipSaved[p] = true
-				p.CanCollide = false
-			end
-		end
-	elseif next(state.carNoclipSaved) then
-		for p in pairs(state.carNoclipSaved) do
-			if p and p.Parent then pcall(function() p.CanCollide = true end) end
-		end
-		state.carNoclipSaved = {}
-	end
-
-	-- Character Noclip
-	if state.toggles.noclipOn or state.flinging then
-		for _, p in ipairs(ch:GetDescendants()) do
-			if p:IsA("BasePart") and p.CanCollide then
-				state.noclipSaved[p] = true
-				p.CanCollide = false
-			end
-		end
-	elseif next(state.noclipSaved) then
-		for p in pairs(state.noclipSaved) do
-			if p and p.Parent then pcall(function() p.CanCollide = true end) end
-		end
-		state.noclipSaved = {}
-	end
-
-	-- Hitbox Expander
-	if CONFIG.hitboxEnabled then
-		for _, plr in ipairs(plrs:GetPlayers()) do
-			if plr ~= lp and plr.Character and selTarget(plr, "auraTargets") then
-				local hum2 = charHumanoid(plr)
-				local part = plr.Character:FindFirstChild(CONFIG.hitboxPart)
-					or plr.Character:FindFirstChild("Head")
-				if part and part:IsA("BasePart") and hum2 and hum2.Health > 0 then
-					if not state.hitboxSaved[part] then
-						state.hitboxSaved[part] = {
-							Size = part.Size,
-							Transparency = part.Transparency,
-							CanCollide = part.CanCollide,
-						}
-					end
-					part.Size = Vector3.new(CONFIG.hitboxSize, CONFIG.hitboxSize, CONFIG.hitboxSize)
-					part.Transparency = CONFIG.hitboxTransparency
-					part.CanCollide = false
-				end
-			end
-		end
-	elseif next(state.hitboxSaved) then
-		for part, orig in pairs(state.hitboxSaved) do
-			if part and part.Parent then
-				pcall(function()
-					part.Size = orig.Size
-					part.Transparency = orig.Transparency
-					part.CanCollide = orig.CanCollide
-				end)
-			end
-		end
-		state.hitboxSaved = {}
-	end
-end
-connect(runSvc.Heartbeat, applyMovementFrame)
-
-connect(uis.JumpRequest, function()
-	if not state.toggles.infJump then return end
-	local hum = charHumanoid()
-	if hum then
-		hum:ChangeState(Enum.HumanoidStateType.Jumping)
-	end
-end)
-
--- ============================================================================
--- TELEPORTS
--- ============================================================================
-local TELEPORTS = {
-	{ name = "Prison Yard",        fn = function() return CFrame.new(779.87, 98.00, 2458.93) end },
-	{ name = "Nexus / Hallway",    fn = function() return CFrame.new(879.00, 99.99, 2373.38) end },
-	{ name = "Guard Armory",       fn = function() return CFrame.new(836.13, 99.99, 2270.45) end },
-	{ name = "Criminal Base",      fn = function() return CFrame.new(-943.46, 94.13, 2063.63) end },
-	{ name = "Cafeteria",          fn = function() return CFrame.new(918.99, 99.99, 2291.60) end },
-	{ name = "Cellblock",          fn = function() return CFrame.new(918.97, 99.99, 2440.78) end },
-	{ name = "Gate Control Room",  fn = function() return CFrame.new(504.53, 102.04, 2242.40) end },
-	{ name = "Prison Roof",        fn = function() return CFrame.new(827.42, 118.99, 2329.62) end },
-	{ name = "Guard Tower",        fn = function() return CFrame.new(823.25, 125.04, 2588.50) end },
-	{ name = "Sewer Escape",       fn = function() return CFrame.new(917.12, 78.70, 2426.35) end },
+R.defaultConfig = {}
+for key, value in pairs(R.config) do R.defaultConfig[key] = value end
+
+R.state = {
+    toggles = {},
+    switches = {},
+    sliders = {},
+    dropdowns = {},
+    connections = {},
+    logLines = {},
+    logCounter = 0,
+    detached = false,
+    loaded = false,
+    open = true,
+    activeTab = nil,
+    isTouch = UIS and UIS.TouchEnabled or false,
+    lastItemPull = 0,
+    itemBusy = false,
+    arrestBusy = false,
+    tazeBusy = false,
+    killCounter = 0,
+    arrestCount = 0,
+    itemCount = 0,
+    fps = 0,
+    frameCount = 0,
+    aimHeld = false,
+    flyLift = 0,
+    flyButtons = {},
+    espUnits = {},
+    tracers = {},
+    chamsSeen = {},
+    noclipSaved = {},
+    barrierSaved = {},
+    gunSaved = {},
+    fpsSaved = {},
+    lightingSaved = nil,
+    cameraFovSaved = nil,
+    silentHook = nil,
+    silentOld = nil,
+    movementBase = nil,
+    picker = nil,
+    layout = {},
+    ui = {},
+    nearby = {},
+    nearbyKey = "",
+    lastStatus = 0,
+    statusText = "starting",
 }
 
-local function teleportTo(cframe)
-	local myRoot = charRoot()
-	if not myRoot or not cframe then return end
-	myRoot.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-	myRoot.CFrame = cframe + Vector3.new(0, 2.5, 0)
-	log("teleported")
+function R.now()
+    return os.clock()
+end
+
+function R.viewport()
+    local camera = workspace and workspace.CurrentCamera
+    if camera and camera.ViewportSize and camera.ViewportSize.X > 0 then
+        return camera.ViewportSize
+    end
+    return Vector2.new(1280, 720)
+end
+
+function R.connect(signal, fn)
+    if not signal then return nil end
+    local ok, connection = pcall(function() return signal:Connect(fn) end)
+    if ok and connection then
+        table.insert(R.state.connections, connection)
+        return connection
+    end
+    return nil
+end
+
+function R.disconnectAll()
+    for _, connection in ipairs(R.state.connections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    R.state.connections = {}
+end
+
+function R.spawn(fn, ...)
+    local args = { ... }
+    local n = select("#", ...)
+    return task.spawn(function()
+        fn(R.unpack(args, 1, n))
+    end)
+end
+
+-- Fire-and-forget with a real error path. Never say "done" just because pcall
+-- returned; callers decide what a successful send means.
+function R.safe(label, fn, ...)
+    -- An unloaded instance keeps its table alive if the caller saved it. Every
+    -- remote path goes through here, so refuse sends after teardown instead of
+    -- letting a stale reference poke the game.
+    if R.state.detached then return false, "detached" end
+    local args = { ... }
+    local n = select("#", ...)
+    local ok, err = pcall(function()
+        return fn(R.unpack(args, 1, n))
+    end)
+    if not ok then
+        R.log(tostring(label or "action") .. " failed: " .. tostring(err), true)
+    end
+    return ok, err
+end
+
+function R.log(message, isErr)
+    local body = tostring(message)
+    if #body > 180 then body = body:sub(1, 177) .. "..." end
+    print("[RiotHub] " .. body)
+    local S = R.state
+    S.logCounter = S.logCounter + 1
+    table.insert(S.logLines, string.format("%3d %s%s", S.logCounter % 1000,
+        isErr and "[ERR] " or "", body))
+    while #S.logLines > R.config.maxLogLines do table.remove(S.logLines, 1) end
+    if R.ui.refreshLog then pcall(R.ui.refreshLog) end
+end
+
+function R.notify(title, text, duration)
+    pcall(function()
+        R.services.StarterGui:SetCore("SendNotification", {
+            Title = tostring(title), Text = tostring(text), Duration = duration or 3,
+        })
+    end)
+end
+
+-- Rebound by the UI module. Every early caller is safe.
+function R.toast() end
+
+function R.setStatus(text, kind)
+    R.state.statusText = tostring(text)
+    if R.ui.setStatus then R.ui.setStatus(text, kind) end
+end
+
+function R.teamColorName(plr)
+    if not plr then return "" end
+    local ok, color = pcall(function() return plr.TeamColor end)
+    if ok and color then
+        local okName, name = pcall(function() return color.Name end)
+        if okName and name then return tostring(name) end
+        return tostring(color)
+    end
+    return ""
+end
+
+function R.teamName(plr)
+    if not plr then return "" end
+    local ok, team = pcall(function() return plr.Team end)
+    if ok and team then return tostring(team.Name) end
+    return ""
+end
+
+function R.isGuard(plr)
+    local color = R.teamColorName(plr)
+    local name = string.lower(R.teamName(plr))
+    return color == "Bright blue" or string.find(name, "guard", 1, true) ~= nil
+        or string.find(name, "police", 1, true) ~= nil
+end
+
+function R.isInmate(plr)
+    local color = R.teamColorName(plr)
+    local name = string.lower(R.teamName(plr))
+    return color == "Bright orange" or string.find(name, "inmate", 1, true) ~= nil
+        or string.find(name, "prisoner", 1, true) ~= nil
+end
+
+function R.isCrim(plr)
+    local color = R.teamColorName(plr)
+    local name = string.lower(R.teamName(plr))
+    return color == "Bright red" or string.find(name, "criminal", 1, true) ~= nil
+end
+
+function R.matchesFilter(plr, filter)
+    if filter == "Guards" then return R.isGuard(plr) end
+    if filter == "Inmates" then return R.isInmate(plr) end
+    if filter == "Criminals" then return R.isCrim(plr) end
+    return true
+end
+
+function R.character(plr)
+    return (plr or R.lp).Character
+end
+
+function R.humanoid(plr)
+    local character = R.character(plr)
+    return character and character:FindFirstChildOfClass("Humanoid")
+end
+
+function R.root(plr)
+    local character = R.character(plr)
+    return character and (character:FindFirstChild("HumanoidRootPart")
+        or character.PrimaryPart)
+end
+
+function R.alive(plr)
+    local hum = R.humanoid(plr)
+    return hum ~= nil and hum.Health > 0
+end
+
+function R.isCuffed(plr)
+    local character = R.character(plr)
+    local head = character and character:FindFirstChild("Head")
+    return head ~= nil and head:FindFirstChild("handcuffedGui") ~= nil
+end
+
+function R.validTarget(plr, filter)
+    if not plr or plr == R.lp then return false end
+    if not R.alive(plr) then return false end
+    if not R.root(plr) then return false end
+    if filter and not R.matchesFilter(plr, filter) then return false end
+    return true
+end
+
+function R.nearest(filter, radius)
+    local myRoot = R.root()
+    if not myRoot then return nil end
+    local best, bestDistance = nil, radius or math.huge
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if R.validTarget(plr, filter) then
+            local theirRoot = R.root(plr)
+            local distance = (theirRoot.Position - myRoot.Position).Magnitude
+            if distance <= bestDistance then
+                best, bestDistance = plr, distance
+            end
+        end
+    end
+    return best, bestDistance
 end
 
 -- ============================================================================
--- AIMBOT & SILENT AIM
+-- REMOTES
 -- ============================================================================
-local fovRing
-local function buildFovRing()
-	fovRing = Instance.new("ScreenGui")
-	fovRing.Name = "RiotHubFOVRing"
-	fovRing.IgnoreGuiInset = true
-	fovRing.ResetOnSpawn = false
-	fovRing.Parent = lp:WaitForChild("PlayerGui")
-
-	local ringHolder = Instance.new("Frame")
-	ringHolder.Name = "Ring"
-	ringHolder.AnchorPoint = Vector2.new(0.5, 0.5)
-	ringHolder.Position = UDim2.new(0.5, 0, 0.5, 0)
-	ringHolder.BackgroundTransparency = 1
-	ringHolder.Size = UDim2.fromOffset(CONFIG.aimbotFov * 2, CONFIG.aimbotFov * 2)
-	ringHolder.Visible = false
-	ringHolder.Parent = fovRing
-
-	local circle = Instance.new("Frame")
-	circle.Name = "Circle"
-	circle.AnchorPoint = Vector2.new(0.5, 0.5)
-	circle.Position = UDim2.new(0.5, 0, 0.5, 0)
-	circle.Size = UDim2.new(1, 0, 1, 0)
-	circle.BackgroundColor3 = Color3.fromRGB(255, 73, 90)
-	circle.BackgroundTransparency = 0.90
-	circle.BorderSizePixel = 0
-	circle.Parent = ringHolder
-	local uc = Instance.new("UICorner")
-	uc.CornerRadius = UDim.new(1, 0)
-	uc.Parent = circle
-	local us = Instance.new("UIStroke")
-	us.Color = Color3.fromRGB(255, 73, 90)
-	us.Transparency = 0.35
-	us.Thickness = 1.5
-	us.Parent = circle
+function R.remotesFolder(timeout)
+    local ws = workspace
+    if not ws then return nil end
+    return ws:FindFirstChild("Remote") or ws:WaitForChild("Remote", timeout or 5)
 end
 
-local function setupAimbot()
-	connect(runSvc.RenderStepped, function()
-		if state.detached then return end
-		local camera = currentCam()
-		if not camera then return end
-		if fovRing then
-			local ring = fovRing:FindFirstChild("Ring")
-			if ring then
-				local show = CONFIG.showAimFov and (state.toggles.aimOn or state.toggles.silentOn)
-				ring.Visible = show
-				if show then
-					local diameter = math.clamp(CONFIG.aimbotFov * 2, 40, 900)
-					ring.Size = UDim2.fromOffset(diameter, diameter)
-				end
-			end
-		end
-		if not state.toggles.aimOn then return end
-		local best, bestAng
-		for _, plr in ipairs(plrs:GetPlayers()) do
-			if plr ~= lp and plr.Character and plr.Character:FindFirstChild("Head") then
-				local hum = charHumanoid(plr)
-				if hum and hum.Health > 0 and selTarget(plr, "aimbotTargets") then
-					local head = plr.Character.Head
-					local to = head.Position - camera.CFrame.Position
-					if to.Magnitude > 2 then
-						local ang = math.deg(math.acos(math.clamp(
-							camera.CFrame.LookVector:Dot(to.Unit), -1, 1)))
-						if ang <= CONFIG.aimbotFov then
-							if not bestAng or ang < bestAng then best, bestAng = head, ang end
-						end
-					end
-				end
-			end
-		end
-		if best then
-			local goal = CFrame.lookAt(camera.CFrame.Position, best.Position)
-			local smooth = math.clamp(1 - (CONFIG.aimbotSmooth / 100), 0.06, 1)
-			camera.CFrame = camera.CFrame:Lerp(goal, smooth)
-		end
-	end)
+function R.getRemote(remoteName, timeout)
+    local folder = R.remotesFolder(timeout)
+    if not folder then return nil end
+    return folder:FindFirstChild(remoteName) or folder:WaitForChild(remoteName, timeout or 2)
 end
 
-local hookInstalled = false
-local function setupSilentAim()
-	task.spawn(function()
-		local hookFn = hookmetamethod
-		if not hookFn or hookInstalled then return end
-		hookInstalled = true
-		local oldNamecall
-		oldNamecall = hookFn(game, "__namecall", function(self, ...)
-			local method = getnamecallmethod and getnamecallmethod() or ""
-			local args = packArgs(...)
-			if self == shootingEvent and (method == "FireServer" or method == "")
-				and state.toggles.silentOn and type(args[1]) == "table" then
-				pcall(function()
-					local camera = currentCam()
-					if not camera then return end
-					local best, bestAng
-					for _, plr in ipairs(plrs:GetPlayers()) do
-						if plr ~= lp and plr.Character and plr.Character:FindFirstChild("Head") then
-							local hum = charHumanoid(plr)
-							if hum and hum.Health > 0 and selTarget(plr, "aimbotTargets") then
-								local head = plr.Character.Head
-								local to = head.Position - camera.CFrame.Position
-								if to.Magnitude > 2 then
-									local ang = math.deg(math.acos(math.clamp(
-										camera.CFrame.LookVector:Dot(to.Unit), -1, 1)))
-									if ang <= CONFIG.silentFov then
-										if not bestAng or ang < bestAng then best, bestAng = head, ang end
-									end
-								end
-							end
-						end
-					end
-					if best then
-						if CONFIG.silentWallCheck then
-							local params = RaycastParams.new()
-							params.FilterType = Enum.RaycastFilterType.Exclude
-							params.FilterDescendantsInstances = { lp.Character, best.Parent }
-							local hit = workspace:Raycast(
-								camera.CFrame.Position,
-								best.Position - camera.CFrame.Position, params)
-							if hit and hit.Instance and not hit.Instance:IsDescendantOf(best.Parent) then
-								return
-							end
-						end
-						if math.random(1, 100) <= CONFIG.silentHitChance then
-							for _, b in ipairs(args[1]) do
-								local aimPart = best
-								if CONFIG.silentRandomPart and math.random() < 0.4 then
-									aimPart = best.Parent:FindFirstChild("Torso") or best
-								end
-								b["Cframe"]  = aimPart.CFrame
-								b["Hit"]     = aimPart
-								b["HitPart"] = aimPart
-							end
-						end
-					end
-				end)
-			end
-			return oldNamecall(self, spread(args))
-		end)
-		log("silent aim hooked onto ShootEvent")
-	end)
+function R.resolveRemotes()
+    local M = R.remotes
+    task.spawn(function()
+        local folder = R.remotesFolder(15)
+        if folder then
+            M.folder = folder
+            M.item = folder:FindFirstChild("ItemHandler") or folder:WaitForChild("ItemHandler", 8)
+            M.arrest = folder:FindFirstChild("arrest") or folder:FindFirstChild("Arrest")
+            M.team = folder:FindFirstChild("TeamEvent")
+            M.loadchar = folder:FindFirstChild("loadchar")
+            M.gate = folder:FindFirstChild("PrisonGate")
+            R.log("remotes: ItemHandler=" .. tostring(M.item ~= nil)
+                .. " arrest=" .. tostring(M.arrest ~= nil)
+                .. " team=" .. tostring(M.team ~= nil))
+        else
+            R.log("Remote folder not found yet; use Setup > Rebind remotes", true)
+        end
+        local rs = R.services.ReplicatedStorage
+        M.melee = rs:FindFirstChild("meleeEvent") or rs:WaitForChild("meleeEvent", 10)
+        M.shoot = rs:FindFirstChild("ShootEvent") or rs:WaitForChild("ShootEvent", 10)
+        R.log("remotes: melee=" .. tostring(M.melee ~= nil)
+            .. " shoot=" .. tostring(M.shoot ~= nil))
+        if R.ui.syncStatus then pcall(R.ui.syncStatus) end
+    end)
+end
+
+function R.rebindRemotes()
+    local M = R.remotes
+    local folder = R.remotesFolder(4)
+    if folder then
+        M.folder = folder
+        M.item = folder:FindFirstChild("ItemHandler") or M.item
+        M.arrest = folder:FindFirstChild("arrest") or folder:FindFirstChild("Arrest") or M.arrest
+        M.team = folder:FindFirstChild("TeamEvent") or M.team
+        M.loadchar = folder:FindFirstChild("loadchar") or M.loadchar
+    end
+    local rs = R.services.ReplicatedStorage
+    M.melee = M.melee or rs:FindFirstChild("meleeEvent")
+    M.shoot = M.shoot or rs:FindFirstChild("ShootEvent")
+    local summary = string.format("melee=%s shoot=%s item=%s arrest=%s",
+        tostring(M.melee ~= nil), tostring(M.shoot ~= nil),
+        tostring(M.item ~= nil), tostring(M.arrest ~= nil))
+    R.log("rebind: " .. summary, not (M.melee and M.shoot and M.item))
+    if R.ui.syncStatus then pcall(R.ui.syncStatus) end
+    return M
 end
 
 -- ============================================================================
--- TRIGGERBOT
+-- ITEM GRANTING
 -- ============================================================================
-local function triggerFire()
-	pcall(function()
-		if mouse1press then
-			mouse1press()
-			task.wait(0.01)
-			if mouse1release then mouse1release() end
-		else
-			local tool = lp.Character and lp.Character:FindFirstChildWhichIsA("Tool")
-			if tool then
-				tool:Activate()
-				task.delay(0.03, function() pcall(function() tool:Deactivate() end) end)
-			end
-		end
-	end)
+function R.prisonItems()
+    return workspace:FindFirstChild("Prison_ITEMS")
 end
 
-local function setupTriggerBot()
-	connect(runSvc.RenderStepped, function()
-		if state.detached or not state.toggles.triggerOn then return end
-		local t = mouse.Target
-		if not (t and t.Parent) then return end
-		local hum = t.Parent:FindFirstChildOfClass("Humanoid")
-		if not (hum and hum.Health > 0) then return end
-		local plr = plrs:GetPlayerFromCharacter(t.Parent)
-		if not plr or plr == lp then return end
-		if not selTarget(plr, "triggerTargets") then return end
-		local tool = lp.Character and lp.Character:FindFirstChildWhichIsA("Tool")
-		if tool and tool:FindFirstChild("GunStates") then triggerFire() end
-	end)
+function R.findItemAnywhere(itemName)
+    local tableRoot = R.prisonItems()
+    if not tableRoot then return nil end
+    return tableRoot:FindFirstChild(itemName, true)
 end
 
+function R.getItemIn(subfolder, itemName, childName)
+    local tableRoot = R.prisonItems()
+    if not tableRoot then return nil end
+    local folder = tableRoot:FindFirstChild(subfolder)
+    if not folder then return nil end
+    local entry = folder:FindFirstChild(itemName)
+    if not entry then return nil end
+    if childName then
+        return entry:FindFirstChild(childName)
+            or entry:FindFirstChild("ITEMPICKUP")
+            or entry:FindFirstChildWhichIsA("BasePart")
+    end
+    return entry
+end
+
+function R.pace()
+    -- Reserve a slot before waiting. Concurrent give actions therefore get
+    -- distinct slots instead of waking together and bursting the server.
+    local now = R.now()
+    local slot = math.max(now, (R.state.lastItemPull or 0) + R.config.itemPace)
+    R.state.lastItemPull = slot
+    local left = slot - now
+    if left > 0 then task.wait(left) end
+end
+
+function R.giveItem(holder, label)
+    if R.state.detached then return false end
+    local M = R.remotes
+    if not M.item then
+        local folder = R.remotesFolder(2)
+        if folder then M.item = folder:FindFirstChild("ItemHandler") end
+    end
+    if not M.item then
+        R.log("ItemHandler unavailable; cannot grant " .. tostring(label), true)
+        return false
+    end
+    R.pace()
+    if R.state.detached then return false end
+    local ok = R.safe("give " .. tostring(label), function()
+        M.item:InvokeServer(holder)
+    end)
+    if ok then
+        R.state.itemCount = R.state.itemCount + 1
+        R.log("grant request sent: " .. tostring(label or "item"))
+    end
+    return ok
+end
+
+function R.giveAnywhere(itemName)
+    local target = R.findItemAnywhere(itemName)
+    if not target then
+        R.log("item not on this map: " .. tostring(itemName), true)
+        return false
+    end
+    local pivot = CFrame.new(0, 100, 0)
+    pcall(function() pivot = R.lp.Character:GetPivot() end)
+    return R.giveItem({ Position = pivot, Parent = target }, itemName)
+end
+
+function R.giveLegacy(itemName, subfolder)
+    local child = R.getItemIn(subfolder or "giver", itemName, "ITEMPICKUP")
+        or R.getItemIn("giver", itemName, "ITEMPICKUP")
+        or R.getItemIn(subfolder or "giver", itemName)
+    if not child then
+        R.log("legacy giver missing: " .. tostring(itemName), true)
+        return false
+    end
+    return R.giveItem(child, itemName)
+end
+
+function R.giveBest(itemName, subfolder)
+    if R.giveAnywhere(itemName) then return true end
+    return R.giveLegacy(itemName, subfolder)
+end
+
+R.GUNS = { "M9", "MP5", "Remington 870", "AK-47", "M4A1" }
+R.MELEE = { "Key card", "Hammer", "Crude Knife" }
+
+function R.giveSelectedGun()
+    local name = R.config.gunChoice
+    local ok = R.giveBest(name, "giver")
+    if R.state.detached then return ok end
+    if ok then
+        R.toast("Gun", tostring(name) .. " request sent; check your backpack.", 2, "ok")
+    else
+        R.toast("Gun not sent", "No request reached ItemHandler for " .. tostring(name) .. ".", 3, "err")
+    end
+    return ok
+end
+
+function R.giveNamedGear(itemName)
+    local ok = R.giveBest(itemName, "giver")
+    if R.state.detached then return ok end
+    if ok then
+        R.toast(tostring(itemName), "Request sent; check your backpack.", 2, "ok")
+    else
+        R.toast(tostring(itemName),
+            "Not found, or ItemHandler refused the request.", 2, "err")
+    end
+    return ok
+end
+
+function R.giveKit()
+    if R.state.itemBusy then
+        R.log("kit already running", true)
+        R.toast("Kit busy", "Another item grant is already running.", 2, "warn")
+        return
+    end
+    R.state.itemBusy = true
+    local totalRequests = #R.GUNS + #R.MELEE + 2
+    local estimate = math.ceil(totalRequests * math.max(R.config.itemPace, 0.1))
+    R.toast("Kit started", tostring(totalRequests) .. " paced requests (~" .. tostring(estimate)
+        .. "s). Check the log for rejected items.", 3, "ok")
+    task.spawn(function()
+        R.log("granting full kit; item pacing is "
+            .. tostring(R.config.itemPace) .. "s per request")
+        local total, sent = 0, 0
+        local function request(itemName)
+            if R.state.detached then return end
+            total = total + 1
+            if R.giveBest(itemName, "giver") then sent = sent + 1 end
+        end
+        for _, gun in ipairs(R.GUNS) do request(gun) end
+        for _, melee in ipairs(R.MELEE) do request(melee) end
+        for _, tool in ipairs({ "Handcuffs", "Taser" }) do request(tool) end
+        R.state.itemBusy = false
+        if R.state.detached then return end
+        if sent > 0 then
+            R.toast("Kit requests sent",
+                tostring(sent) .. "/" .. tostring(total)
+                .. " reached ItemHandler; check your backpack.", 3, "ok")
+        else
+            R.toast("Kit not sent", "No item request reached ItemHandler.", 3, "err")
+        end
+        R.log("kit results: " .. tostring(sent) .. "/" .. tostring(total)
+            .. " request(s) sent")
+    end)
+end
+
+function R.giveRiotGear()
+    task.spawn(function()
+        local total, sent = 0, 0
+        local function request(itemName)
+            if R.state.detached then return end
+            total = total + 1
+            if R.giveBest(itemName, "giver") then sent = sent + 1 end
+        end
+        request("Riot Shield")
+        -- Hats are folders containing a "hat" part. The original script sent
+        -- that part, not the folder, so keep that payload shape when present
+        -- and only fall back to the catalog-entry form.
+        local hatName = (R.findItemAnywhere("Police hat") and "Police hat")
+            or (R.findItemAnywhere("Riot helmet") and "Riot helmet")
+        if hatName then
+            local hatPart = R.getItemIn("hats", hatName, "hat")
+            if hatPart then
+                total = total + 1
+                if R.giveItem(hatPart, hatName) then sent = sent + 1 end
+            else
+                request(hatName)
+            end
+        else
+            R.log("no police hat or riot helmet on this map", true)
+        end
+        local maskPart = R.getItemIn("hats", "Ski mask", "hat")
+        if maskPart then
+            total = total + 1
+            if R.giveItem(maskPart, "Ski mask") then sent = sent + 1 end
+        elseif R.findItemAnywhere("Ski mask") then
+            request("Ski mask")
+        else
+            R.log("no ski mask on this map", true)
+        end
+        if R.state.detached then return end
+        if sent > 0 then
+            R.toast("Riot gear", tostring(sent) .. "/" .. tostring(total)
+                .. " request(s) reached ItemHandler; check your backpack.", 3, "ok")
+        else
+            R.toast("Riot gear not sent", "No riot gear request reached ItemHandler.", 3, "err")
+        end
+        R.log("riot gear requests: " .. tostring(sent) .. "/" .. tostring(total))
+    end)
+end
+
+function R.ensureGun(preferred, budget)
+    local function find()
+        local character = R.character()
+        local backpack = R.lp.Backpack
+        local containers = { character, backpack }
+        for _, container in ipairs(containers) do
+            if container then
+                if preferred then
+                    local named = container:FindFirstChild(preferred)
+                    if named and named:IsA("Tool") and named:FindFirstChild("GunStates") then
+                        return named
+                    end
+                end
+                for _, tool in ipairs(container:GetChildren()) do
+                    if tool:IsA("Tool") and tool:FindFirstChild("GunStates") then
+                        return tool
+                    end
+                end
+            end
+        end
+        return nil
+    end
+    local tool = find()
+    if tool then return tool end
+    R.giveBest(preferred or R.config.gunChoice, "giver")
+    for _ = 1, math.max(budget or 6, 1) do
+        task.wait(0.5)
+        if R.state.detached then return nil end
+        tool = find()
+        if tool then return tool end
+    end
+    return nil
+end
 -- ============================================================================
--- VISUALS — ESP, CHAMS, TRACERS, FULLBRIGHT, FPS BOOST
+-- FEATURES — every function here is called from the UI or the runtime loops.
 -- ============================================================================
-local espContainer
-local function ensureEspContainer()
-	if espContainer and espContainer.Parent then return espContainer end
-	espContainer = Instance.new("Folder")
-	espContainer.Name = "RiotHubEspOverlays"
-	espContainer.Parent = lp:WaitForChild("PlayerGui", 10)
-		or (gethui and gethui())
-		or game:FindFirstChildOfClass("CoreGui")
-	return espContainer
-end
 
-local function teamTint(plr)
-	return isGuard(plr) and Color3.fromRGB(100, 165, 255)
-		or isInmate(plr) and Color3.fromRGB(255, 160, 65)
-		or isCrim(plr) and Color3.fromRGB(255, 80, 85)
-		or Color3.fromRGB(220, 220, 220)
-end
+local S = R.state
+local C = R.config
+local Players = R.services.Players
+local UIS = R.services.UserInputService
+local RunService = R.services.RunService
 
-local function applyChams(plr)
-	pcall(function()
-		local ch = plr.Character
-		if not ch then return end
-		local hil = ch:FindFirstChild("RiotHub_Cham")
-		if not state.toggles.chamsOn then
-			if hil then hil:Destroy() end
-			return
-		end
-		if not hil then
-			hil = Instance.new("Highlight")
-			hil.Name = "RiotHub_Cham"
-			hil.Parent = ch
-		end
-		hil.FillColor = teamTint(plr)
-		hil.FillTransparency = 0.55
-		hil.DepthMode = CONFIG.chamsThroughWalls and Enum.HighlightDepthMode.AlwaysOnTop
-			or Enum.HighlightDepthMode.Occluded
-		hil.OutlineColor = Color3.new(0, 0, 0)
-		hil.OutlineTransparency = 0.2
-	end)
-end
-
-local function clearChams(plr)
-	pcall(function()
-		local ch = plr and plr.Character
-		if ch then
-			local hil = ch:FindFirstChild("RiotHub_Cham")
-			if hil then hil:Destroy() end
-		end
-	end)
-end
-
-local function buildEspUnit(plr)
-	local unit = { conns = {} }
-	local bb = Instance.new("BillboardGui")
-	bb.Name = "RiotHub_ESP"
-	bb.Size = UDim2.new(7, 0, 2.2, 0)
-	bb.StudsOffset = Vector3.new(0, 1.8, 0)
-	bb.AlwaysOnTop = true
-	bb.MaxDistance = 2500
-	bb.Adornee = plr.Character and plr.Character:FindFirstChild("Head")
-	bb.Parent = ensureEspContainer()
-
-	local nameLabel = Instance.new("TextLabel")
-	nameLabel.Name = "NameLabel"
-	nameLabel.Size = UDim2.new(1, 0, 0.5, 0)
-	nameLabel.BackgroundTransparency = 1
-	nameLabel.Font = Enum.Font.GothamBold
-	nameLabel.TextSize = 13
-	nameLabel.TextColor3 = Color3.new(1, 1, 1)
-	nameLabel.TextStrokeTransparency = 0.25
-	nameLabel.Parent = bb
-
-	local distLabel = Instance.new("TextLabel")
-	distLabel.Name = "DistLabel"
-	distLabel.Size = UDim2.new(1, 0, 0.5, 0)
-	distLabel.Position = UDim2.new(0, 0, 0.5, 0)
-	distLabel.BackgroundTransparency = 1
-	distLabel.Font = Enum.Font.Gotham
-	distLabel.TextSize = 11
-	distLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
-	distLabel.TextStrokeTransparency = 0.4
-	distLabel.Parent = bb
-
-	unit.billboard = bb
-	unit.nameLabel = nameLabel
-	unit.distLabel = distLabel
-
-	table.insert(unit.conns, connect(plr.CharacterAdded, function()
-		task.wait(0.3)
-		bb.Adornee = plr.Character and plr.Character:FindFirstChild("Head")
-		applyChams(plr)
-	end))
-	applyChams(plr)
-	return unit
-end
-
-local function destroyEspUnit(plr)
-	local unit = state.espUnits[plr]
-	if not unit then return end
-	for _, c in ipairs(unit.conns) do pcall(function() c:Disconnect() end) end
-	if unit.billboard then unit.billboard:Destroy() end
-	state.espUnits[plr] = nil
-end
-
-local function refreshEsp()
-	for _, plr in ipairs(plrs:GetPlayers()) do
-		if plr ~= lp then
-			if state.toggles.espOn then
-				if not state.espUnits[plr] then state.espUnits[plr] = buildEspUnit(plr) end
-			else
-				destroyEspUnit(plr)
-			end
-			applyChams(plr)
-		end
-	end
-	for plr, _ in pairs(state.espUnits) do
-		if not plr.Parent then destroyEspUnit(plr) end
-	end
-end
-
-local drawingOk = pcall(function() return Drawing end) and Drawing ~= nil
-local function destroyTracer(plr)
-	local line = state.tracers[plr]
-	if line then
-		pcall(function() line:Remove() end)
-		state.tracers[plr] = nil
-	end
-end
-
-local function setupEspFrame()
-	connect(runSvc.RenderStepped, function()
-		if state.detached then return end
-		local camera = currentCam()
-		if not camera then return end
-		for plr, unit in pairs(state.espUnits) do
-			local ch = plr.Character
-			local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-			local head = ch and ch:FindFirstChild("Head")
-			local visible = (state.toggles.espOn == true) and (head ~= nil) and (hum ~= nil)
-			if visible and hum.Health <= 0 then visible = false end
-			if visible and CONFIG.espVisibleOnly then
-				local ok, vis = pcall(function()
-					local params = RaycastParams.new()
-					params.FilterType = Enum.RaycastFilterType.Exclude
-					params.FilterDescendantsInstances = { lp.Character, ch }
-					local hit = workspace:Raycast(camera.CFrame.Position,
-						head.Position - camera.CFrame.Position, params)
-					if hit and hit.Instance then
-						return hit.Instance:IsDescendantOf(ch)
-					end
-					return true
-				end)
-				visible = (not ok) and true or vis
-			end
-			unit.billboard.Enabled = visible
-			if visible then
-				unit.billboard.Adornee = head
-				local dist = (head.Position - camera.CFrame.Position).Magnitude
-				local hpTxt = ""
-				if CONFIG.espHealthBar then
-					hpTxt = string.format(" [%d%%]",
-						math.floor(hum.Health / math.max(hum.MaxHealth, 1) * 100 + 0.5))
-				end
-				local tool = ch:FindFirstChildWhichIsA("Tool")
-				local toolTxt = tool and (" · " .. tool.Name) or ""
-				unit.nameLabel.Text = (CONFIG.espNames and (plr.Name .. hpTxt) or "")
-				unit.distLabel.Text = (CONFIG.espDistance and string.format("%dm%s", dist, toolTxt) or toolTxt)
-				unit.nameLabel.TextColor3 = CONFIG.espTeamColor and teamTint(plr) or Color3.new(1, 1, 1)
-			end
-			if drawingOk and CONFIG.espTracers and visible then
-				pcall(function()
-					local vp = camera:WorldToViewportPoint(head.Position)
-					if vp.Z <= 0 then
-						destroyTracer(plr)
-						return
-					end
-					local line = state.tracers[plr]
-					if not line then
-						line = Drawing.new("Line")
-						line.Thickness = 1.4
-						line.Transparency = 0.75
-						state.tracers[plr] = line
-					end
-					line.From = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y)
-					line.To = Vector2.new(vp.X, vp.Y)
-					line.Color = teamTint(plr)
-					line.Visible = true
-				end)
-			else
-				destroyTracer(plr)
-			end
-		end
-	end)
-end
-
-local savedLighting = nil
-local function setFullbright(on)
-	pcall(function()
-		if on then
-			if not savedLighting then
-				savedLighting = {
-					Ambient = lighting.Ambient, OutdoorAmbient = lighting.OutdoorAmbient,
-					Brightness = lighting.Brightness, FogEnd = lighting.FogEnd,
-					ClockTime = lighting.ClockTime, GlobalShadows = lighting.GlobalShadows,
-				}
-			end
-			lighting.Ambient = Color3.new(1, 1, 1)
-			lighting.OutdoorAmbient = Color3.new(1, 1, 1)
-			lighting.Brightness = 2.8
-			lighting.FogEnd = 1e10
-			lighting.ClockTime = 14
-			lighting.GlobalShadows = false
-		elseif savedLighting then
-			lighting.Ambient = savedLighting.Ambient
-			lighting.OutdoorAmbient = savedLighting.OutdoorAmbient
-			lighting.Brightness = savedLighting.Brightness
-			lighting.FogEnd = savedLighting.FogEnd
-			lighting.ClockTime = savedLighting.ClockTime
-			lighting.GlobalShadows = savedLighting.GlobalShadows
-		end
-	end)
-end
-
-local fpsBoostConn
-local function setFpsBoost(on)
-	if fpsBoostConn then
-		fpsBoostConn:Disconnect()
-		fpsBoostConn = nil
-	end
-	if not on then return end
-	pcall(function()
-		for _, d in ipairs(workspace:GetDescendants()) do
-			if d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Smoke")
-				or d:IsA("Fire") or d:IsA("Beam") then
-				pcall(function() d.Enabled = false end)
-			end
-		end
-		fpsBoostConn = connect(workspace.DescendantAdded, function(d)
-			if d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Smoke")
-				or d:IsA("Fire") or d:IsA("Beam") then
-				pcall(function() d.Enabled = false end)
-			end
-		end)
-	end)
+do
+    local ok, drawing = pcall(function() return Drawing end)
+    R.drawingOk = ok and drawing ~= nil
 end
 
 -- ============================================================================
--- UI ENGINE v4 — RESPONSIVE, ANIMATED, MOBILE + PC READY
+-- GUN ENGINE
 -- ============================================================================
-if CONFIG.reduceAnim then state.uiAnim = 0 end
+local GUN_FIELDS = {
+    "Damage", "Bullets", "FireRate", "Spread", "ReloadTime",
+    "AutoFire", "MaxAmmo", "StoredAmmo", "CurrentAmmo",
+}
 
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "RiotHub_GUI"
-screenGui.IgnoreGuiInset = true
-screenGui.ResetOnSpawn = false
-screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-local uiParent = lp:WaitForChild("PlayerGui", 10)
-if not uiParent and gethui then pcall(function() uiParent = gethui() end) end
-if not uiParent then uiParent = game:FindFirstChildOfClass("CoreGui") end
-screenGui.Parent = uiParent
+function R.gunState(tool)
+    if not (tool and tool:FindFirstChild("GunStates")) then return nil end
+    local ok, state = pcall(function() return require(tool.GunStates) end)
+    if ok and type(state) == "table" then return state end
+    return nil
+end
+
+function R.findGunTool(preferred)
+    local function sweep(container)
+        if not container then return nil end
+        if preferred then
+            local named = container:FindFirstChild(preferred)
+            if named and named:IsA("Tool") and named:FindFirstChild("GunStates") then
+                return named
+            end
+        end
+        for _, tool in ipairs(container:GetChildren()) do
+            if tool:IsA("Tool") and tool:FindFirstChild("GunStates") then
+                return tool
+            end
+        end
+        return nil
+    end
+    return sweep(R.character()) or sweep(R.lp.Backpack)
+end
+
+function R.buildBullets(targetPart, count)
+    local bullets = {}
+    for index = 1, count or 1 do
+        bullets[index] = {
+            RayObject = Ray.new(Vector3.new(0, 0, 0), Vector3.new(0.1, 0.1, 0.1)),
+            Distance = 25,
+            Cframe = targetPart and targetPart.CFrame or CFrame.new(),
+            Color = Color3.fromRGB(255, 255, 0),
+            HitPart = targetPart,
+            Visualize = false,
+        }
+    end
+    return bullets
+end
+
+function R.shootAt(plr, tool, count)
+    local shoot = R.remotes.shoot
+    if not shoot then return false end
+    local character = R.character(plr)
+    if not character then return false end
+    local part = character:FindFirstChild("Head")
+        or character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("Torso")
+        or character:FindFirstChild("HumanoidRootPart")
+    if not part then return false end
+    local bullets = R.buildBullets(part, count)
+    return R.safe("ShootEvent", function()
+        shoot:FireServer(bullets, tool)
+    end)
+end
+
+function R.modGun(tool)
+    if S.detached then return false end
+    if not (tool and tool:IsA("Tool") and tool:FindFirstChild("GunStates")) then
+        R.log("not a moddable gun: " .. tostring(tool and tool.Name), true)
+        return false
+    end
+    local module = R.gunState(tool)
+    if not module then
+        R.log("GunStates is not a readable table on " .. tool.Name, true)
+        return false
+    end
+    if not S.gunSaved[tool] then
+        local snapshot = {}
+        for _, field in ipairs(GUN_FIELDS) do snapshot[field] = module[field] end
+        S.gunSaved[tool] = snapshot
+    end
+    local ok = pcall(function()
+        module.Damage = C.gunDamage
+        module.Bullets = C.gunBullets
+        module.FireRate = math.max(C.gunFireRate, 0.0001)
+        module.Spread = C.gunSpread
+        module.ReloadTime = 0.0001
+        module.AutoFire = C.gunAutoFire
+        module.MaxAmmo = math.max(module.MaxAmmo or 0, 1000)
+        module.StoredAmmo = 999999
+        if C.gunInfiniteAmmo then
+            module.CurrentAmmo = math.huge
+        else
+            module.CurrentAmmo = module.MaxAmmo
+        end
+    end)
+    if not ok then
+        R.log("GunStates write failed on " .. tool.Name .. " (locked module?)", true)
+        return false
+    end
+    R.log("GunStates rewritten client-side on " .. tool.Name)
+    return true
+end
+
+function R.modAllGuns()
+    if S.detached then return 0 end
+    local hits = 0
+    local function sweep(container)
+        if not container then return end
+        for _, tool in ipairs(container:GetChildren()) do
+            if tool:IsA("Tool") and tool:FindFirstChild("GunStates") then
+                if R.modGun(tool) then hits = hits + 1 end
+            end
+        end
+    end
+    sweep(R.character())
+    sweep(R.lp.Backpack)
+    if hits == 0 then
+        R.log("no GunStates tools in the character/backpack", true)
+    else
+        R.log("gun mods applied to " .. hits .. " tool(s)")
+    end
+    return hits
+end
+
+function R.restoreGuns()
+    for tool, snapshot in pairs(S.gunSaved) do
+        local module = R.gunState(tool)
+        if module then
+            for field, value in pairs(snapshot) do
+                pcall(function() module[field] = value end)
+            end
+        end
+    end
+    S.gunSaved = {}
+end
+
+function R.modSelectedGun()
+    local tool = R.findGunTool(C.gunChoice)
+    if not tool then
+        tool = R.ensureGun(C.gunChoice, 4)
+    end
+    if not tool then
+        R.toast("No gun", "Could not find or obtain " .. C.gunChoice, 3, "err")
+        return false
+    end
+    local ok = R.modGun(tool)
+    if ok then
+        R.toast("Gun modded", tool.Name .. " — client-side GunStates write", 3, "ok")
+    end
+    return ok
+end
+
+-- ============================================================================
+-- COMBAT
+-- ============================================================================
+function R.meleeBurst(plr, hits)
+    local event = R.remotes.melee
+    if not event then return false end
+    if not R.alive(plr) then return false end
+    local count = hits or C.meleeBurstHits
+    local sent = 0
+    for _ = 1, count do
+        if S.detached then break end
+        if R.safe("meleeEvent", function() event:FireServer(plr) end) then
+            sent = sent + 1
+            S.killCounter = S.killCounter + 1
+        end
+        task.wait(0.05)
+    end
+    return sent > 0, sent
+end
+
+function R.gunKill(plr)
+    local tool = R.findGunTool(C.gunChoice) or R.findGunTool()
+    if not tool then return false end
+    local module = R.gunState(tool)
+    if module and (module.Damage or 0) < C.gunDamage then
+        R.modGun(tool)
+    end
+    if R.shootAt(plr, tool, C.gunBulletsPerCall) then
+        S.killCounter = S.killCounter + 1
+        return true
+    end
+    return false
+end
+
+function R.killTarget(plr)
+    if not R.validTarget(plr, C.auraTargets) then return false end
+    local character = R.character(plr)
+    local forcefield = character and character:FindFirstChildOfClass("ForceField")
+    if forcefield and C.respectForcefield then
+        return false
+    end
+    if C.killAuraMode == "Gun" and R.gunKill(plr) then
+        return true
+    end
+    return R.meleeBurst(plr, C.meleeBurstHits)
+end
+
+function R.killAll()
+    task.spawn(function()
+        local hits, attempted = 0, 0
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if S.detached then return end
+            if plr ~= R.lp and R.alive(plr) and R.matchesFilter(plr, C.auraTargets) then
+                local character = R.character(plr)
+                local forcefield = character and character:FindFirstChildOfClass("ForceField")
+                if not (forcefield and C.respectForcefield) then
+                    attempted = attempted + 1
+                    local sent = false
+                    if C.killAuraMode == "Gun" and R.gunKill(plr) then
+                        sent = true
+                    end
+                    -- Gun mode falls back to fists only when the gun request
+                    -- did not go out, matching killTarget instead of always
+                    -- firing both payloads at the same player.
+                    if not sent then
+                        local _, meleeSent = R.meleeBurst(plr, C.meleeBurstHits)
+                        sent = (meleeSent or 0) > 0
+                    end
+                    if sent then hits = hits + 1 end
+                    task.wait(0.08)
+                end
+            end
+        end
+        R.log("kill-all requests sent for " .. hits .. "/" .. attempted .. " target(s)")
+        if hits > 0 then
+            R.toast("Kill All", tostring(hits) .. " target(s) — requests sent", 2, "ok")
+        elseif attempted > 0 then
+            R.toast("Kill All", "No request could be sent for " .. tostring(attempted) .. " target(s).", 3, "err")
+        else
+            R.toast("Kill All", "No living player matched the target filter.", 2, "warn")
+        end
+    end)
+end
+
+function R.tazeTarget(plr, tool)
+    if not R.remotes.shoot or not R.alive(plr) then return false end
+    local character = R.character(plr)
+    local part = character:FindFirstChild("Torso")
+        or character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("HumanoidRootPart")
+    if not part then return false end
+    local taser = tool or R.getTaser()
+    if not taser then return false end
+    local bullets = R.buildBullets(part, 1)
+    return R.safe("taze", function()
+        R.remotes.shoot:FireServer(bullets, taser)
+    end)
+end
+
+function R.getTaser()
+    local character = R.character()
+    if character and character:FindFirstChild("Taser") then
+        return character:FindFirstChild("Taser")
+    end
+    if R.lp.Backpack and R.lp.Backpack:FindFirstChild("Taser") then
+        return R.lp.Backpack:FindFirstChild("Taser")
+    end
+    return nil
+end
+
+function R.tazeAll()
+    task.spawn(function()
+        local taser = R.getTaser()
+        if not taser then
+            -- Do not look frozen while a paced item request and up to four
+            -- seconds of waiting run. Say what is being waited for first.
+            R.toast("Taze All", "No Taser yet — requesting one; this can take a few seconds.", 3, "warn")
+            R.giveBest("Taser", "giver")
+            for _ = 1, 8 do
+                task.wait(0.5)
+                taser = R.getTaser()
+                if taser then break end
+            end
+        end
+        if not taser then
+            R.toast("No Taser", "Join the Guard team or obtain a Taser first.", 3, "err")
+            return
+        end
+        local sent, attempted = 0, 0
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if S.detached then return end
+            if plr ~= R.lp and R.validTarget(plr, C.auraTargets) then
+                attempted = attempted + 1
+                if R.tazeTarget(plr, taser) then sent = sent + 1 end
+                task.wait(math.max(C.tazeRate / 4, 0.1))
+            end
+        end
+        R.log("taze requests sent for " .. sent .. "/" .. attempted .. " target(s)")
+        if sent > 0 then
+            R.toast("Taze All", tostring(sent) .. " request(s) sent", 2, "ok")
+        elseif attempted > 0 then
+            R.toast("Taze All", "No taze request could be sent.", 3, "err")
+        else
+            R.toast("Taze All", "No living player matched the target filter.", 2, "warn")
+        end
+    end)
+end
+
+function R.getArrestRemote()
+    local M = R.remotes
+    if not M.arrest then
+        local folder = R.remotesFolder(2)
+        if folder then
+            M.arrest = folder:FindFirstChild("arrest") or folder:FindFirstChild("Arrest")
+        end
+    end
+    return M.arrest
+end
+
+function R.arrestOnce(target)
+    local remote = R.getArrestRemote()
+    if not remote then
+        R.log("arrest RemoteFunction unavailable", true)
+        return false
+    end
+    local theirRoot = R.root(target)
+    if not theirRoot then return false end
+    if C.arrestSnap then
+        local myRoot = R.root()
+        if myRoot then
+            myRoot.CFrame = theirRoot.CFrame * CFrame.new(0, 0, 1.4)
+        end
+    end
+    return R.safe("arrest", function() remote:InvokeServer(theirRoot) end)
+end
+
+function R.arrestTarget(target)
+    if not R.validTarget(target, C.auraTargets) then return false end
+    if R.isGuard(target) then
+        R.log("cannot arrest a guard: " .. target.Name, true)
+        return false
+    end
+    for _ = 1, 10 do
+        if S.detached then return false end
+        local sent = R.arrestOnce(target)
+        task.wait(0.08)
+        if R.isCuffed(target) then
+            S.arrestCount = S.arrestCount + 1
+            return true
+        end
+        -- A throwing RemoteFunction will throw for every retry; stop instead
+        -- of spamming the server ten times.
+        if not sent then return false end
+    end
+    return false
+end
+
+function R.arrestAll()
+    task.spawn(function()
+        local n, attempted = 0, 0
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if S.detached then return end
+            if R.validTarget(plr, C.auraTargets) and not R.isCuffed(plr) then
+                attempted = attempted + 1
+                if R.arrestTarget(plr) then n = n + 1 end
+                task.wait(0.35)
+            end
+        end
+        R.log("arrest-all confirmed " .. n .. "/" .. attempted .. " cuff(s)")
+        if n > 0 then
+            R.toast("Arrest All", tostring(n) .. "/" .. tostring(attempted)
+                .. " cuff(s) confirmed client-side", 2, "ok")
+        elseif attempted > 0 then
+            R.toast("Arrest All", "No cuff confirmed for " .. tostring(attempted)
+                .. " target(s); the server may have rejected the request.", 3, "warn")
+        else
+            R.toast("Arrest All", "No arrestable player matched the target filter.", 2, "warn")
+        end
+    end)
+end
+
+function R.nearestArrestable(radius)
+    local myRoot = R.root()
+    if not myRoot then return nil end
+    local best, bestDistance = nil, radius or math.huge
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if R.validTarget(plr, C.auraTargets) and not R.isGuard(plr)
+            and not R.isCuffed(plr) then
+            local theirRoot = R.root(plr)
+            if theirRoot then
+                local distance = (theirRoot.Position - myRoot.Position).Magnitude
+                if distance <= bestDistance then
+                    best, bestDistance = plr, distance
+                end
+            end
+        end
+    end
+    return best, bestDistance
+end
+
+-- ============================================================================
+-- AUTO COLLECT
+-- ============================================================================
+function R.collectNearest(radius)
+    local root = R.root()
+    local tableRoot = R.prisonItems()
+    if not (root and tableRoot) then return false end
+    local best, bestDistance = nil, radius or C.autoCollectRadius
+    for _, object in ipairs(tableRoot:GetDescendants()) do
+        if object:IsA("BasePart") and object.Name == "ITEMPICKUP" then
+            local distance = (object.Position - root.Position).Magnitude
+            if distance <= bestDistance then
+                best, bestDistance = object, distance
+            end
+        end
+    end
+    if not best then return false end
+    return R.giveItem(best, best:GetFullName())
+end
+
+-- ============================================================================
+-- MOVEMENT / FLY / NOCLIP
+-- ============================================================================
+function R.captureMovementBase()
+    local hum = R.humanoid()
+    if hum then
+        S.movementBase = { WalkSpeed = hum.WalkSpeed, JumpPower = hum.JumpPower }
+    end
+end
+
+function R.restoreMovement()
+    local hum = R.humanoid()
+    if hum and S.movementBase then
+        pcall(function() hum.WalkSpeed = S.movementBase.WalkSpeed end)
+        pcall(function() hum.JumpPower = S.movementBase.JumpPower end)
+    end
+    S.movementBase = nil
+end
+
+function R.stopFly()
+    S.flyLift = 0
+    local root = R.root()
+    if root then
+        pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+    end
+end
+
+function R.restoreNoclip()
+    for part, original in pairs(S.noclipSaved) do
+        if part and part.Parent then
+            pcall(function() part.CanCollide = original end)
+        end
+    end
+    S.noclipSaved = {}
+    S.noclipCharacter = nil
+    S.lastNoclipAt = nil
+end
+
+function R.setNoclip(on)
+    if S.detached then return false end
+    if not on then
+        R.restoreNoclip()
+        return
+    end
+    local character = R.character()
+    if not character then return end
+    for _, part in ipairs(character:GetDescendants()) do
+        if part:IsA("BasePart") then
+            if S.noclipSaved[part] == nil then
+                S.noclipSaved[part] = part.CanCollide
+            end
+            part.CanCollide = false
+        end
+    end
+end
+
+function R.findBarrierParts()
+    local parts = {}
+    for _, containerName in ipairs({ "Doors", "Prison_Fences" }) do
+        local container = workspace:FindFirstChild(containerName)
+        if container then
+            for _, part in ipairs(container:GetDescendants()) do
+                if part:IsA("BasePart") then table.insert(parts, part) end
+            end
+        end
+    end
+    return parts
+end
+
+function R.setBarriers(walkThrough)
+    if walkThrough then
+        for _, part in ipairs(R.findBarrierParts()) do
+            if S.barrierSaved[part] == nil then
+                S.barrierSaved[part] = part.CanCollide
+            end
+            pcall(function() part.CanCollide = false end)
+        end
+        R.log("walk-through barriers enabled (client-side)")
+    else
+        for part, original in pairs(S.barrierSaved) do
+            if part and part.Parent then
+                pcall(function() part.CanCollide = original end)
+            end
+        end
+        S.barrierSaved = {}
+        R.log("barrier collision restored")
+    end
+end
+
+function R.applyMovement(dt)
+    if S.detached then return end
+    local character = R.character()
+    if not character then return end
+    local hum = character:FindFirstChildOfClass("Humanoid")
+    local root = character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
+    if not (hum and root) then return end
+    if not S.movementBase then R.captureMovementBase() end
+
+    if S.forceWalk or C.walkSpeed ~= 16 then
+        if hum.WalkSpeed ~= C.walkSpeed then hum.WalkSpeed = C.walkSpeed end
+    end
+    if S.forceJump or C.jumpPower ~= 50 then
+        if hum.JumpPower ~= C.jumpPower then hum.JumpPower = C.jumpPower end
+    end
+    if C.antiStun and hum.WalkSpeed == 0 then
+        hum.WalkSpeed = math.max(C.walkSpeed, 16)
+    end
+
+    if S.toggles.tpWalkOn and not S.toggles.flyOn and hum.MoveDirection.Magnitude > 0.3 then
+        root.CFrame = root.CFrame + hum.MoveDirection * C.tpWalkPower * dt * 60
+    end
+
+    if S.toggles.spinOn then
+        root.CFrame = root.CFrame * CFrame.Angles(0, math.rad(C.spinSpeed) * dt, 0)
+    end
+
+    if S.toggles.flyOn then
+        local camera = workspace.CurrentCamera
+        if camera then
+            local move = Vector3.new(0, 0, 0)
+            if UIS:IsKeyDown(Enum.KeyCode.W) then move = move + camera.CFrame.LookVector end
+            if UIS:IsKeyDown(Enum.KeyCode.S) then move = move - camera.CFrame.LookVector end
+            if UIS:IsKeyDown(Enum.KeyCode.A) then move = move - camera.CFrame.RightVector end
+            if UIS:IsKeyDown(Enum.KeyCode.D) then move = move + camera.CFrame.RightVector end
+            if hum.MoveDirection.Magnitude > 0.05 then
+                move = move + hum.MoveDirection
+            end
+            if move.Magnitude > 1 then move = move.Unit end
+            local lift = S.flyLift
+            if UIS:IsKeyDown(Enum.KeyCode.E) then lift = lift + 1 end
+            if UIS:IsKeyDown(Enum.KeyCode.Q) then lift = lift - 1 end
+            root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            root.CFrame = root.CFrame
+                + move * C.flySpeed * 20 * dt
+                + Vector3.new(0, lift * C.flySpeed * 16 * dt, 0)
+        end
+    end
+
+    if S.toggles.noclipOn then
+        -- Do not walk every character descendant on every frame; phones pay
+        -- for that. Re-scan on a new character or twice a second, which still
+        -- catches accessories/tools added after the toggle.
+        local now = R.now()
+        if S.noclipCharacter ~= character or not S.lastNoclipAt
+            or now - S.lastNoclipAt >= 0.5 then
+            S.noclipCharacter = character
+            S.lastNoclipAt = now
+            R.setNoclip(true)
+        end
+    elseif next(S.noclipSaved) then
+        R.restoreNoclip()
+    end
+end
+
+function R.teleportTo(cframe, label)
+    if S.detached then return false end
+    local root = R.root()
+    if not root then
+        R.toast("No character", "Wait for your character to spawn.", 2, "err")
+        return false
+    end
+    root.CFrame = cframe + Vector3.new(0, 2.5, 0)
+    R.log("teleported to " .. tostring(label or "location") .. " (client-side)")
+    R.toast("Teleport", tostring(label or "location"), 1.5, "ok")
+    return true
+end
+
+function R.teleportToItem(itemName, label)
+    if S.detached then return false end
+    local item = R.findItemAnywhere(itemName)
+    if not item then
+        R.log("teleport target item missing: " .. tostring(itemName), true)
+        R.toast("Not found", tostring(itemName) .. " is not on this map.", 2, "err")
+        return false
+    end
+    local part = item:IsA("BasePart") and item
+        or item:FindFirstChildWhichIsA("BasePart", true)
+    if not part then
+        R.log("item has no BasePart: " .. tostring(itemName), true)
+        return false
+    end
+    return R.teleportTo(part.CFrame + Vector3.new(0, 4, 0), label or itemName)
+end
+
+R.TELEPORTS = {
+    { label = "Yard",             position = Vector3.new(916.81, 99.99, 2373.38) },
+    { label = "Guard Spawn",      position = Vector3.new(837.35, 99.99, 2303.22) },
+    { label = "Cafeteria",        position = Vector3.new(945.71, 99.80, 2320.33) },
+    { label = "Police Room",      position = Vector3.new(909.45, 99.99, 2258.89) },
+    { label = "Gate Button",      position = Vector3.new(504.53, 104.91, 2240.84) },
+    { label = "Riot Gear Stand",  position = Vector3.new(853.40, 100.70, 2216.49) },
+    { label = "Criminal Base",    position = Vector3.new(-938.77, 94.13, 2063.85) },
+    { label = "Crim Base Hammer", position = Vector3.new(808.08, 95.59, 2525.31) },
+}
+
+function R.teleportNearestPlayer()
+    local target = R.nearest(C.auraTargets, math.huge)
+    if not target then
+        R.toast("No target", "No living player matches the filter.", 2, "err")
+        return false
+    end
+    local root = R.root(target)
+    if not root then return false end
+    return R.teleportTo(root.CFrame * CFrame.new(0, 0, 3), target.Name)
+end
+
+-- ============================================================================
+-- AIM / TRIGGER
+-- ============================================================================
+function R.buildAimRing()
+    local playerGui = R.lp:FindFirstChild("PlayerGui")
+    if not playerGui then return end
+    local screen = Instance.new("ScreenGui")
+    screen.Name = "RiotHubMobile_FOV"
+    screen.ResetOnSpawn = false
+    screen.IgnoreGuiInset = false
+    screen.DisplayOrder = 5
+    pcall(function()
+        screen.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets
+        screen.ClipToDeviceSafeArea = true
+    end)
+    screen.Parent = playerGui
+
+    local ring = Instance.new("Frame")
+    ring.Name = "Ring"
+    ring.AnchorPoint = Vector2.new(0.5, 0.5)
+    ring.Position = UDim2.new(0.5, 0, 0.5, 0)
+    ring.BackgroundColor3 = Color3.fromRGB(255, 84, 100)
+    ring.BackgroundTransparency = 0.88
+    ring.BorderSizePixel = 0
+    ring.Visible = false
+    ring.Parent = screen
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = ring
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(255, 84, 100)
+    stroke.Transparency = 0.35
+    stroke.Thickness = 1.5
+    stroke.Parent = ring
+
+    S.ui.fovScreen = screen
+    S.ui.fovRing = ring
+end
+
+function R.cameraTarget(fov, filter)
+    local camera = workspace.CurrentCamera
+    if not camera then return nil end
+    local best, bestAngle = nil, nil
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if R.validTarget(plr, filter) then
+            local head = R.character(plr):FindFirstChild("Head")
+            if head then
+                local toTarget = head.Position - camera.CFrame.Position
+                if toTarget.Magnitude > 3 then
+                    local angle = math.deg(math.acos(math.clamp(
+                        camera.CFrame.LookVector:Dot(toTarget.Unit), -1, 1)))
+                    if angle <= fov and (not bestAngle or angle < bestAngle) then
+                        best, bestAngle = head, angle
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+function R.hasLineOfSight(targetHead)
+    local camera = workspace.CurrentCamera
+    if not camera or not targetHead then return false end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local ignore = { targetHead.Parent }
+    local character = R.character()
+    if character then table.insert(ignore, 1, character) end
+    params.FilterDescendantsInstances = ignore
+    local hit = workspace:Raycast(camera.CFrame.Position,
+        targetHead.Position - camera.CFrame.Position, params)
+    if hit and hit.Instance then
+        return hit.Instance:IsDescendantOf(targetHead.Parent)
+    end
+    return true
+end
+
+function R.updateAim(dt)
+    if S.detached then return end
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    local ring = S.ui.fovRing
+    local showRing = C.showAimFov and (S.toggles.aimOn or S.toggles.silentOn)
+    if ring then
+        ring.Visible = showRing
+        if showRing then
+            local diameter = 2 * math.tan(math.rad(C.aimbotFov) / 2)
+                / math.max(math.tan(math.rad(camera.FieldOfView) / 2), 0.01)
+                * (camera.ViewportSize.Y / 2)
+            diameter = math.clamp(diameter, 30, camera.ViewportSize.Y * 0.95)
+            ring.Size = UDim2.fromOffset(diameter, diameter)
+        end
+    end
+
+    local target = nil
+    if S.toggles.silentOn then
+        target = R.cameraTarget(C.silentFov, C.aimbotTargets)
+    elseif S.toggles.aimOn or S.toggles.triggerOn then
+        target = R.cameraTarget(C.aimbotFov, C.aimbotTargets)
+    end
+    S.aimTarget = target
+
+    if S.toggles.aimOn and target then
+        local held = UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+            or S.aimHeld or C.aimAlwaysLock
+        if held then
+            local goal = CFrame.lookAt(camera.CFrame.Position, target.Position)
+            local speed = math.clamp(1 - (C.aimbotSmooth / 100), 0.04, 1)
+            local alpha = 1 - math.exp(-speed * 18 * math.max(dt, 0.001))
+            camera.CFrame = camera.CFrame:Lerp(goal, math.clamp(alpha, 0.02, 1))
+        end
+    end
+end
+
+function R.triggerTick()
+    if S.detached or not S.toggles.triggerOn or S.open then return end
+    local now = R.now()
+    if now - (S.lastTrigger or 0) < 0.12 then return end
+    S.lastTrigger = now
+    local target = S.aimTarget
+    if not target then return end
+    if C.silentWallCheck and not R.hasLineOfSight(target) then return end
+    local tool = R.character() and R.character():FindFirstChildWhichIsA("Tool")
+    if not tool or not tool:FindFirstChild("GunStates") then return end
+    pcall(function() tool:Activate() end)
+    task.delay(0.05, function()
+        if not S.detached then pcall(function() tool:Deactivate() end) end
+    end)
+end
+
+function R.setupSilentAim()
+    if S.silentHook ~= nil then return true end
+    local hookFn = hookmetamethod
+    local getNamecall = getnamecallmethod
+    if not hookFn then
+        R.log("hookmetamethod unavailable; silent aim is off", true)
+        return false
+    end
+    local old
+    local callback = function(self, ...)
+        local args = { ... }
+        local argc = select("#", ...)
+        if S.detached then
+            return old(self, R.unpack(args, 1, argc))
+        end
+        local method = getNamecall and getNamecall() or nil
+        local isFire = (method == nil) or method == "FireServer"
+        if isFire and self == R.remotes.shoot and S.toggles.silentOn
+            and type(args[1]) == "table" then
+            pcall(function()
+                local head = R.cameraTarget(C.silentFov, C.aimbotTargets)
+                if not head then return end
+                if C.silentWallCheck and not R.hasLineOfSight(head) then return end
+                if math.random(1, 100) > C.silentHitChance then return end
+                for _, bullet in ipairs(args[1]) do
+                    local part = head
+                    if C.silentRandomPart then
+                        local character = head.Parent
+                        local other = character and (character.PrimaryPart
+                            or character:FindFirstChild("Torso")
+                            or character:FindFirstChild("UpperTorso"))
+                        if other and math.random() < 0.5 then part = other end
+                    end
+                    bullet.Cframe = part.CFrame
+                    bullet.HitPart = part
+                end
+                if R.now() - (S.lastSilentLog or 0) > 2 then
+                    S.lastSilentLog = R.now()
+                    R.log("silent aim re-pointed a shot at " .. head.Parent.Name)
+                end
+            end)
+        end
+        return old(self, R.unpack(args, 1, argc))
+    end
+    local ok, result = pcall(hookFn, game, "__namecall", callback)
+    if not ok or type(result) ~= "function" then
+        R.log("silent aim hook failed: " .. tostring(result), true)
+        return false
+    end
+    old = result
+    S.silentHook = hookFn
+    S.silentOld = old
+    R.log("silent aim hook installed")
+    return true
+end
+
+function R.removeSilentAim()
+    if S.silentHook and S.silentOld then
+        pcall(function() S.silentHook(game, "__namecall", S.silentOld) end)
+        R.log("silent aim hook restored")
+    end
+    S.silentHook = nil
+    S.silentOld = nil
+end
+
+-- ============================================================================
+-- ESP / CHAMS / TRACERS
+-- ============================================================================
+function R.ensureEspFolder()
+    local folder = S.ui.espFolder
+    if folder and folder.Parent then return folder end
+    local parent = R.lp:FindFirstChild("PlayerGui")
+    if not parent then return nil end
+    folder = Instance.new("Folder")
+    folder.Name = "RiotHubMobile_ESP"
+    folder.Parent = parent
+    S.ui.espFolder = folder
+    return folder
+end
+
+function R.teamTint(plr)
+    if R.isGuard(plr) then return Color3.fromRGB(110, 170, 255) end
+    if R.isInmate(plr) then return Color3.fromRGB(255, 165, 70) end
+    if R.isCrim(plr) then return Color3.fromRGB(255, 90, 90) end
+    return Color3.fromRGB(225, 225, 225)
+end
+
+function R.applyChams(plr)
+    local character = R.character(plr)
+    if not character then return end
+    local highlight = character:FindFirstChild("RiotHub_Cham")
+    if not S.toggles.chamsOn then
+        if highlight then highlight:Destroy() end
+        return
+    end
+    if not highlight then
+        highlight = Instance.new("Highlight")
+        highlight.Name = "RiotHub_Cham"
+        highlight.Parent = character
+    end
+    highlight.FillColor = R.teamTint(plr)
+    highlight.FillTransparency = 0.55
+    highlight.OutlineColor = Color3.new(0, 0, 0)
+    highlight.OutlineTransparency = 0.25
+    highlight.DepthMode = C.chamsThroughWalls
+        and Enum.HighlightDepthMode.AlwaysOnTop
+        or Enum.HighlightDepthMode.Occluded
+end
+
+function R.buildEspUnit(plr)
+    local folder = R.ensureEspFolder()
+    if not folder then return nil end
+    local unit = { connections = {} }
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "RiotHub_ESP_" .. plr.Name
+    billboard.Size = UDim2.new(7, 0, 2.4, 0)
+    billboard.StudsOffset = Vector3.new(0, 2.2, 0)
+    billboard.AlwaysOnTop = true
+    billboard.MaxDistance = 2000
+    billboard.Adornee = R.character(plr) and R.character(plr):FindFirstChild("Head")
+    billboard.Parent = folder
+
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Name = "NameLabel"
+    nameLabel.Size = UDim2.new(1, 0, 0, 18)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.Font = Enum.Font.GothamBold
+    nameLabel.TextSize = 14
+    nameLabel.TextColor3 = Color3.new(1, 1, 1)
+    nameLabel.TextStrokeTransparency = 0.3
+    nameLabel.Parent = billboard
+
+    local distLabel = Instance.new("TextLabel")
+    distLabel.Name = "DistLabel"
+    distLabel.Size = UDim2.new(1, 0, 0, 14)
+    distLabel.Position = UDim2.new(0, 0, 0, 18)
+    distLabel.BackgroundTransparency = 1
+    distLabel.Font = Enum.Font.Gotham
+    distLabel.TextSize = 11
+    distLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
+    distLabel.TextStrokeTransparency = 0.45
+    distLabel.Parent = billboard
+
+    local barBack = Instance.new("Frame")
+    barBack.Name = "HealthBack"
+    barBack.Size = UDim2.new(0.8, 0, 0, 4)
+    barBack.Position = UDim2.new(0.1, 0, 1, -3)
+    barBack.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
+    barBack.BorderSizePixel = 0
+    barBack.Parent = billboard
+    local barCorner = Instance.new("UICorner")
+    barCorner.CornerRadius = UDim.new(1, 0)
+    barCorner.Parent = barBack
+
+    local barFill = Instance.new("Frame")
+    barFill.Name = "HealthFill"
+    barFill.Size = UDim2.new(1, 0, 1, 0)
+    barFill.BackgroundColor3 = Color3.fromRGB(80, 220, 150)
+    barFill.BorderSizePixel = 0
+    barFill.Parent = barBack
+    local fillCorner = Instance.new("UICorner")
+    fillCorner.CornerRadius = UDim.new(1, 0)
+    fillCorner.Parent = barFill
+
+    unit.billboard = billboard
+    unit.nameLabel = nameLabel
+    unit.distLabel = distLabel
+    unit.healthFill = barFill
+    unit.connections[#unit.connections + 1] = R.connect(plr.CharacterAdded, function()
+        task.wait(0.4)
+        if S.detached then return end
+        local character = R.character(plr)
+        billboard.Adornee = character and character:FindFirstChild("Head")
+        R.applyChams(plr)
+    end)
+    R.applyChams(plr)
+    return unit
+end
+
+function R.destroyEspUnit(plr)
+    local unit = S.espUnits[plr]
+    if not unit then return end
+    for _, connection in ipairs(unit.connections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    if unit.billboard then unit.billboard:Destroy() end
+    S.espUnits[plr] = nil
+    -- A tracer belongs to the ESP unit; without this, a player who leaves or
+    -- turns ESP off would leave a visible line behind until unload.
+    local line = S.tracers[plr]
+    if line then
+        pcall(function() line:Remove() end)
+        S.tracers[plr] = nil
+    end
+end
+
+function R.clearEsp()
+    for plr in pairs(S.espUnits) do R.destroyEspUnit(plr) end
+    if S.ui.espFolder then
+        pcall(function() S.ui.espFolder:Destroy() end)
+        S.ui.espFolder = nil
+    end
+    for plr, line in pairs(S.tracers) do
+        pcall(function() line:Remove() end)
+        S.tracers[plr] = nil
+    end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local character = R.character(plr)
+        local highlight = character and character:FindFirstChild("RiotHub_Cham")
+        if highlight then pcall(function() highlight:Destroy() end) end
+    end
+end
+
+function R.refreshEsp()
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= R.lp then
+            if S.toggles.espOn then
+                if not S.espUnits[plr] then
+                    S.espUnits[plr] = R.buildEspUnit(plr)
+                end
+            else
+                R.destroyEspUnit(plr)
+            end
+            if S.toggles.chamsOn then R.applyChams(plr) end
+        end
+    end
+    for plr, unit in pairs(S.espUnits) do
+        if not plr.Parent or not unit.billboard or not unit.billboard.Parent then
+            R.destroyEspUnit(plr)
+        end
+    end
+end
+
+function R.updateEsp()
+    if S.detached then return end
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    for plr, unit in pairs(S.espUnits) do
+        local character = R.character(plr)
+        local hum = character and character:FindFirstChildOfClass("Humanoid")
+        local head = character and character:FindFirstChild("Head")
+        local visible = S.toggles.espOn and head ~= nil and hum ~= nil and hum.Health > 0
+        if visible and C.espVisibleOnly then
+            visible = R.hasLineOfSight(head)
+        end
+        unit.billboard.Enabled = visible
+        if visible then
+            unit.billboard.Adornee = head
+            local distance = (head.Position - camera.CFrame.Position).Magnitude
+            local hp = math.floor(hum.Health / math.max(hum.MaxHealth, 1) * 100 + 0.5)
+            unit.nameLabel.Text = C.espNames and plr.Name or ""
+            unit.nameLabel.TextColor3 = C.espTeamColor
+                and R.teamTint(plr) or Color3.new(1, 1, 1)
+            unit.distLabel.Text = C.espDistance and string.format("%dm", distance) or ""
+            if C.espHealth then
+                unit.distLabel.Text = (unit.distLabel.Text ~= "" and (unit.distLabel.Text .. "  ") or "")
+                    .. hp .. "%"
+            end
+            unit.healthFill.Size = UDim2.new(math.clamp(hp / 100, 0, 1), 0, 1, 0)
+            unit.healthFill.BackgroundColor3 = hp > 50
+                and Color3.fromRGB(80, 220, 150)
+                or (hp > 25 and Color3.fromRGB(255, 190, 80) or Color3.fromRGB(255, 90, 110))
+        end
+    end
+end
+
+function R.updateTracers()
+    if S.detached then return end
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    if not (S.toggles.espOn and C.espTracers) then
+        for plr, line in pairs(S.tracers) do
+            pcall(function() line:Remove() end)
+            S.tracers[plr] = nil
+        end
+        return
+    end
+    if not R.drawingOk then return end
+    -- Prune lines whose ESP unit disappeared (player left or ESP was turned
+    -- off between frames).
+    for plr, line in pairs(S.tracers) do
+        if not S.espUnits[plr] then
+            pcall(function() line:Remove() end)
+            S.tracers[plr] = nil
+        end
+    end
+    for plr, unit in pairs(S.espUnits) do
+        local ok = pcall(function()
+            local character = R.character(plr)
+            local head = character and character:FindFirstChild("Head")
+            local hum = character and character:FindFirstChildOfClass("Humanoid")
+            if head and hum and hum.Health > 0 and unit.billboard.Enabled then
+                local screenPoint, onScreen = camera:WorldToViewportPoint(head.Position)
+                if onScreen and screenPoint.Z > 0 then
+                    local line = S.tracers[plr]
+                    if not line then
+                        line = Drawing.new("Line")
+                        line.Thickness = 1.4
+                        line.Transparency = 0.7
+                        S.tracers[plr] = line
+                    end
+                    line.From = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y)
+                    line.To = Vector2.new(screenPoint.X, screenPoint.Y)
+                    line.Color = R.teamTint(plr)
+                    line.Visible = true
+                else
+                    local line = S.tracers[plr]
+                    if line then line.Visible = false end
+                end
+            else
+                local line = S.tracers[plr]
+                if line then line.Visible = false end
+            end
+        end)
+        if not ok then
+            local line = S.tracers[plr]
+            if line then pcall(function() line.Visible = false end) end
+        end
+    end
+end
+
+-- ============================================================================
+-- LIGHTING / FPS BOOST / CAMERA
+-- ============================================================================
+function R.setFullbright(on)
+    local lighting = R.services.Lighting
+    if not lighting then return end
+    if on then
+        if not S.lightingSaved then
+            S.lightingSaved = {
+                Ambient = lighting.Ambient,
+                OutdoorAmbient = lighting.OutdoorAmbient,
+                Brightness = lighting.Brightness,
+                FogEnd = lighting.FogEnd,
+                FogStart = lighting.FogStart,
+                ClockTime = lighting.ClockTime,
+                GlobalShadows = lighting.GlobalShadows,
+            }
+        end
+        pcall(function()
+            lighting.Ambient = Color3.new(1, 1, 1)
+            lighting.OutdoorAmbient = Color3.new(1, 1, 1)
+            lighting.Brightness = 3
+            lighting.FogEnd = 1e10
+            lighting.FogStart = 0
+            lighting.ClockTime = 14
+            lighting.GlobalShadows = false
+        end)
+    elseif S.lightingSaved then
+        local saved = S.lightingSaved
+        pcall(function()
+            lighting.Ambient = saved.Ambient
+            lighting.OutdoorAmbient = saved.OutdoorAmbient
+            lighting.Brightness = saved.Brightness
+            lighting.FogEnd = saved.FogEnd
+            lighting.FogStart = saved.FogStart
+            lighting.ClockTime = saved.ClockTime
+            lighting.GlobalShadows = saved.GlobalShadows
+        end)
+        S.lightingSaved = nil
+    end
+end
+
+function R.setFpsBoost(on)
+    if on then
+        local function disable(object)
+            if S.fpsSaved[object] == nil then
+                S.fpsSaved[object] = object.Enabled
+            end
+            pcall(function() object.Enabled = false end)
+        end
+        for _, object in ipairs(workspace:GetDescendants()) do
+            if object:IsA("ParticleEmitter") or object:IsA("Trail")
+                or object:IsA("Smoke") or object:IsA("Fire") or object:IsA("Beam") then
+                disable(object)
+            end
+        end
+        if S.fpsConn then S.fpsConn:Disconnect() end
+        S.fpsConn = R.connect(workspace.DescendantAdded, function(object)
+            if object:IsA("ParticleEmitter") or object:IsA("Trail")
+                or object:IsA("Smoke") or object:IsA("Fire") or object:IsA("Beam") then
+                disable(object)
+            end
+        end)
+    else
+        if S.fpsConn then
+            S.fpsConn:Disconnect()
+            S.fpsConn = nil
+        end
+        for object, enabled in pairs(S.fpsSaved) do
+            if object and object.Parent then
+                pcall(function() object.Enabled = enabled end)
+            end
+        end
+        S.fpsSaved = {}
+    end
+end
+
+function R.setCameraFov(value)
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    if not S.cameraFovSaved then S.cameraFovSaved = camera.FieldOfView end
+    camera.FieldOfView = value
+end
+
+function R.restoreCamera()
+    local camera = workspace.CurrentCamera
+    if camera and S.cameraFovSaved then
+        pcall(function() camera.FieldOfView = S.cameraFovSaved end)
+    end
+    S.cameraFovSaved = nil
+end
+
+-- ============================================================================
+-- WORLD ACTIONS
+-- ============================================================================
+function R.openGate()
+    if S.detached then return false end
+    local button = R.getItemIn("buttons", "Prison Gate", "Prison Gate")
+        or R.getItemIn("buttons", "Prison Gate")
+    if not button then
+        R.log("Prison Gate button not present", true)
+        R.toast("Gate", "Prison Gate button not found on this map.", 2, "err")
+        return false
+    end
+    local ok = R.giveItem(button, "Prison Gate")
+    if ok then
+        R.toast("Gate", "Gate request sent", 1.5, "ok")
+    else
+        R.toast("Gate", "No request reached ItemHandler; the gate was not triggered.", 3, "err")
+    end
+    return ok
+end
+
+function R.switchTeam(kind)
+    if S.detached then return false end
+    local teamRemote = R.remotes.team
+    local loadchar = R.remotes.loadchar
+    if not teamRemote or not loadchar then
+        R.rebindRemotes()
+        teamRemote = R.remotes.team
+        loadchar = R.remotes.loadchar
+    end
+    if not (teamRemote and loadchar) then
+        R.log("TeamEvent or loadchar missing", true)
+        R.toast("Team switch", "Team remotes are not available.", 2, "err")
+        return false
+    end
+    task.spawn(function()
+        if kind == "Guard" then
+            R.safe("team", function() teamRemote:FireServer("Bright blue") end)
+            task.wait(0.15)
+            R.safe("loadchar", function() loadchar:InvokeServer(R.lp.Name) end)
+        elseif kind == "Inmate" then
+            R.safe("team", function() teamRemote:FireServer("Bright orange") end)
+            task.wait(0.15)
+            R.safe("loadchar", function() loadchar:InvokeServer(R.lp.Name) end)
+        else
+            R.safe("loadchar", function() loadchar:InvokeServer(R.lp.Name, "Medium stone grey") end)
+        end
+        task.wait(1.5)
+        if S.detached then return end
+        local confirmed = false
+        if kind == "Guard" then
+            confirmed = R.isGuard(R.lp)
+        elseif kind == "Inmate" then
+            confirmed = R.isInmate(R.lp)
+        else
+            confirmed = not R.isGuard(R.lp) and not R.isInmate(R.lp) and not R.isCrim(R.lp)
+        end
+        if confirmed then
+            R.toast("Team", "Now " .. tostring(kind), 2, "ok")
+        else
+            R.toast("Team request sent", "Server did not confirm " .. tostring(kind) .. " on the client.", 3, "warn")
+        end
+        R.log("team switch request -> " .. tostring(kind)
+            .. (confirmed and " (confirmed)" or " (unconfirmed)"))
+    end)
+    return true
+end
+
+function R.becomeGuardWithCuffs()
+    local started = R.switchTeam("Guard")
+    if not started then return false end
+    task.delay(2.2, function()
+        if S.detached then return end
+        local ok = R.giveBest("Handcuffs", "giver")
+        if S.detached then return end
+        if ok then
+            R.toast("Handcuffs", "Request sent after the Guard switch; check your backpack.", 3, "ok")
+        else
+            R.toast("Handcuffs not sent", "No handcuff request reached ItemHandler after the team switch.", 3, "err")
+        end
+    end)
+    return true
+end
+
+function R.respawn()
+    if S.detached then return false end
+    local loadchar = R.remotes.loadchar
+    if not loadchar then
+        R.rebindRemotes()
+        loadchar = R.remotes.loadchar
+    end
+    if not loadchar then
+        R.toast("Respawn", "loadchar remote is not available.", 2, "err")
+        return false
+    end
+    local ok = R.safe("respawn", function() loadchar:InvokeServer(R.lp.Name) end)
+    if ok then
+        R.toast("Respawn", "Request sent", 1.5, "ok")
+    else
+        R.toast("Respawn failed", "loadchar rejected the call on the client.", 3, "err")
+    end
+    return ok
+end
+
+function R.rejoin()
+    if S.detached then return false end
+    local teleport = R.services.TeleportService
+    local ok, err = pcall(function()
+        teleport:Teleport(game.PlaceId, R.lp)
+    end)
+    if ok then
+        R.toast("Rejoin", "Teleport requested", 3, "ok")
+    else
+        R.log("rejoin failed: " .. tostring(err), true)
+        R.toast("Rejoin failed", tostring(err):sub(1, 90), 4, "err")
+    end
+    return ok
+end
+
+function R.antiAfkNow()
+    if S.detached or not C.antiAfk then return false end
+    local ok = pcall(function()
+        R.services.VirtualUser:CaptureController()
+        R.services.VirtualUser:ClickButton2(Vector2.new())
+    end)
+    if ok then R.log("anti-AFK nudge sent") end
+    return ok
+end
+-- ============================================================================
+-- UI — mobile-first layout and components
+-- ============================================================================
+local S = R.state
+local C = R.config
+local UIS = R.services.UserInputService
+local TweenService = R.services.TweenService
+local Players = R.services.Players
 
 local THEME = {
-	bg        = Color3.fromRGB(12, 13, 18),
-	surface   = Color3.fromRGB(18, 20, 27),
-	card      = Color3.fromRGB(26, 29, 38),
-	cardUp    = Color3.fromRGB(36, 40, 52),
-	stroke    = Color3.fromRGB(48, 52, 66),
-	text      = Color3.fromRGB(238, 240, 246),
-	textDim   = Color3.fromRGB(142, 148, 164),
-	accent    = Color3.fromRGB(255, 68, 92),
-	accentDk  = Color3.fromRGB(130, 34, 48),
-	green     = Color3.fromRGB(72, 219, 142),
-	amber     = Color3.fromRGB(255, 188, 76),
+    bg = Color3.fromRGB(16, 18, 24),
+    panel = Color3.fromRGB(24, 27, 35),
+    card = Color3.fromRGB(33, 37, 47),
+    cardUp = Color3.fromRGB(43, 48, 61),
+    stroke = Color3.fromRGB(58, 64, 82),
+    track = Color3.fromRGB(49, 54, 68),
+    text = Color3.fromRGB(238, 241, 248),
+    dim = Color3.fromRGB(151, 159, 178),
+    accent = Color3.fromRGB(86, 231, 205),
+    accentDark = Color3.fromRGB(27, 74, 70),
+    violet = Color3.fromRGB(139, 112, 255),
+    good = Color3.fromRGB(80, 220, 150),
+    warn = Color3.fromRGB(255, 193, 92),
+    danger = Color3.fromRGB(255, 92, 112),
+    dangerDark = Color3.fromRGB(76, 31, 40),
 }
+R.theme = THEME
 
 local function make(class, props, parent)
-	local obj = Instance.new(class)
-	for k, v in pairs(props) do obj[k] = v end
-	if parent then obj.Parent = parent end
-	return obj
-end
-local function corner(o, r)
-	return make("UICorner", { CornerRadius = UDim.new(0, r or 8) }, o)
-end
-local function pad(el, l, r, t, b)
-	return make("UIPadding", {
-		PaddingLeft = UDim.new(0, l or 0), PaddingRight = UDim.new(0, r or 0),
-		PaddingTop = UDim.new(0, t or 0), PaddingBottom = UDim.new(0, b or 0),
-	}, el)
-end
-local function stroke(o, color, thickness)
-	return make("UIStroke", {
-		Color = color or THEME.stroke, Thickness = thickness or 1,
-		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-	}, o)
-end
-local function tw(obj, goal, dur)
-	local ti = TweenInfo.new(dur or state.uiAnim, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
-	local t = tweSvc:Create(obj, ti, goal)
-	t:Play()
-	return t
+    local object = Instance.new(class)
+    for key, value in pairs(props or {}) do
+        object[key] = value
+    end
+    if parent then object.Parent = parent end
+    return object
 end
 
-local view = currentCam() and currentCam().ViewportSize or Vector2.new(1280, 720)
-local winW = math.clamp(view.X - 24, 340, 680)
-local winH = math.clamp(view.Y - 110, 300, 480)
-
-local window = make("Frame", {
-	Name = "Window",
-	Size = UDim2.fromOffset(winW, winH),
-	Position = UDim2.new(0.5, -winW / 2, 0.5, -winH / 2),
-	BackgroundColor3 = THEME.bg, BorderSizePixel = 0, ZIndex = 6,
-}, screenGui)
-corner(window, 14)
-stroke(window, THEME.stroke, 1)
-local windowScale = make("UIScale", { Scale = 1 }, window)
-
-local function enableDrag(frame, handle)
-	local dragging, dragStart, startPos = false, nil, nil
-	handle.InputBegan:Connect(function(io)
-		if io.UserInputType == Enum.UserInputType.MouseButton1
-			or io.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
-			dragStart = io.Position
-			startPos = frame.Position
-		end
-	end)
-	local function onChange(io)
-		if not dragging then return end
-		if io.UserInputType == Enum.UserInputType.MouseMovement
-			or io.UserInputType == Enum.UserInputType.Touch then
-			local delta = Vector2.new(io.Position.X - dragStart.X, io.Position.Y - dragStart.Y)
-			frame.Position = UDim2.new(
-				startPos.X.Scale, startPos.X.Offset + delta.X,
-				startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-		end
-	end
-	handle.InputChanged:Connect(onChange)
-	connect(uis.InputChanged, onChange)
-	connect(uis.InputEnded, function() dragging = false end)
+local function corner(object, radius)
+    local item = make("UICorner", { CornerRadius = UDim.new(0, radius) }, object)
+    return item
 end
 
-local function pingButton(btn)
-	local from = btn.BackgroundColor3
-	tw(btn, { BackgroundColor3 = THEME.cardUp }, 0.06)
-	task.delay(0.07, function()
-		pcall(function() tw(btn, { BackgroundColor3 = from }, 0.12) end)
-	end)
+local function stroke(object, color, thickness, transparency)
+    local item = make("UIStroke", {
+        Color = color or THEME.stroke,
+        Thickness = thickness or 1,
+        Transparency = transparency or 0.3,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, object)
+    return item
 end
 
-local function popWindow()
-	if not windowScale then return end
-	windowScale.Scale = 0.955
-	tw(windowScale, { Scale = 1 }, 0.16)
+local function pad(object, left, right, top, bottom)
+    return make("UIPadding", {
+        PaddingLeft = UDim.new(0, left or 0),
+        PaddingRight = UDim.new(0, right or 0),
+        PaddingTop = UDim.new(0, top or 0),
+        PaddingBottom = UDim.new(0, bottom or 0),
+    }, object)
 end
 
--- FLY PAD (MOBILE FLIGHT CONTROLS)
-local flyPad = make("Frame", {
-	Name = "FlyPad", Visible = false, BackgroundTransparency = 1,
-	Size = UDim2.fromOffset(232, 150),
-	Position = UDim2.new(1, -248, 1, -164), ZIndex = 2,
-}, screenGui)
-local function flyButton(label, prop, amount)
-	local btn = make("TextButton", {
-		Text = label, Font = Enum.Font.GothamBold, TextSize = 15,
-		TextColor3 = THEME.text, BackgroundColor3 = THEME.card,
-		BackgroundTransparency = 0.25, BorderSizePixel = 0, AutoButtonColor = false,
-	}, flyPad)
-	corner(btn, 10)
-	stroke(btn, THEME.stroke)
-	local function set(onoff)
-		state.touchMove[prop] = onoff and amount or 0
-		tw(btn, { BackgroundTransparency = onoff and 0 or 0.25 }, 0.08)
-	end
-	btn.InputBegan:Connect(function(io)
-		if io.UserInputType == Enum.UserInputType.MouseButton1
-			or io.UserInputType == Enum.UserInputType.Touch then set(true) end
-	end)
-	btn.InputEnded:Connect(function(io)
-		if io.UserInputType == Enum.UserInputType.MouseButton1
-			or io.UserInputType == Enum.UserInputType.Touch then set(false) end
-	end)
-	btn.MouseLeave:Connect(function() set(false) end)
-	return btn
-end
-local btnFwd = flyButton("FWD", "fwd", 1)
-btnFwd.Size = UDim2.fromOffset(68, 40); btnFwd.Position = UDim2.new(0, 82, 0, 0)
-local btnBack = flyButton("BCK", "back", 1)
-btnBack.Size = UDim2.fromOffset(68, 40); btnBack.Position = UDim2.new(0, 82, 0, 108)
-local btnUp = flyButton("UP", "up", 1)
-btnUp.Size = UDim2.fromOffset(68, 40); btnUp.Position = UDim2.new(0, 0, 0, 54)
-local btnDown = flyButton("DN", "down", 1)
-btnDown.Size = UDim2.fromOffset(68, 40); btnDown.Position = UDim2.new(0, 164, 0, 54)
-
--- FLOATING SUPER PUNCH BUTTON (FOR MOBILE WHEN SUPER PUNCH IS ON)
-local punchFab = make("TextButton", {
-	Name = "RiotHub_PunchBtn", Text = "PUNCH", Visible = false,
-	Size = UDim2.fromOffset(66, 42),
-	Position = UDim2.new(1, -84, 0.55, 0),
-	BackgroundColor3 = THEME.accent, BorderSizePixel = 0,
-	Font = Enum.Font.GothamBold, TextSize = 12,
-	TextColor3 = Color3.new(1, 1, 1), AutoButtonColor = false, ZIndex = 35,
-}, screenGui)
-corner(punchFab, 10)
-stroke(punchFab, Color3.new(1, 1, 1), 1)
-enableDrag(punchFab, punchFab)
-punchFab.MouseButton1Click:Connect(function()
-	triggerSuperPunch()
-end)
-
--- TOASTS
-local toastHost = make("Frame", {
-	Name = "ToastHost", BackgroundTransparency = 1,
-	Position = UDim2.new(1, -16, 0, 16),
-	Size = UDim2.new(0, 240, 1, -32),
-	AnchorPoint = Vector2.new(1, 0), ZIndex = 20,
-}, screenGui)
-make("UIListLayout", {
-	Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder,
-	HorizontalAlignment = Enum.HorizontalAlignment.Right,
-}, toastHost)
-
-toast = function(title, body, dur, kind)
-	if state.detached then return end
-	pcall(function()
-		local card = make("Frame", {
-			BackgroundColor3 = THEME.card, BorderSizePixel = 0,
-			Size = UDim2.new(1, 0, 0, 54), ZIndex = 50,
-		}, toastHost)
-		corner(card, 10)
-		stroke(card, kind == "err" and THEME.accentDk
-			or kind == "ok" and Color3.fromRGB(40, 95, 65) or THEME.stroke)
-		local bar = make("Frame", {
-			Size = UDim2.new(0, 4, 1, -12), Position = UDim2.new(0, 6, 0, 6),
-			BackgroundColor3 = kind == "err" and THEME.accent
-				or kind == "ok" and THEME.green or THEME.accent, BorderSizePixel = 0,
-		}, card)
-		corner(bar, 2)
-		make("TextLabel", {
-			Text = title, Font = Enum.Font.GothamBold, TextSize = 12,
-			TextColor3 = THEME.text, BackgroundTransparency = 1,
-			Size = UDim2.new(1, -24, 0, 16), Position = UDim2.new(0, 16, 0, 8),
-			TextXAlignment = Enum.TextXAlignment.Left,
-		}, card)
-		make("TextLabel", {
-			Text = body or "", Font = Enum.Font.Gotham, TextSize = 11,
-			TextColor3 = THEME.textDim, BackgroundTransparency = 1,
-			Size = UDim2.new(1, -24, 0, 20), Position = UDim2.new(0, 16, 0, 25),
-			TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true,
-		}, card)
-		card.Position = UDim2.new(1, 20, 0, 0)
-		tw(card, { Position = UDim2.new(0, 0, 0, 0) }, 0.2)
-		task.delay(math.max((dur or 2.4), 0.3), function()
-			if card.Parent then
-				tw(card, { BackgroundTransparency = 1, Position = UDim2.new(1, 20, 0, 0) }, 0.2)
-				task.wait(0.24)
-				pcall(function() card:Destroy() end)
-			end
-		end)
-	end)
+local function gradient(object, colorA, colorB, rotation)
+    return make("UIGradient", {
+        Color = ColorSequence.new(colorA, colorB),
+        Rotation = rotation or 0,
+    }, object)
 end
 
--- FLOATING MOBILE HUB TOGGLE ("RH")
-local toggleFab = make("TextButton", {
-	Name = "ToggleFab", Text = "RH",
-	Size = UDim2.fromOffset(46, 46),
-	Position = UDim2.new(0, 12, 0.5, -23),
-	BackgroundColor3 = THEME.card, BorderSizePixel = 0,
-	Font = Enum.Font.GothamBold, TextSize = 15,
-	TextColor3 = THEME.accent,
-	Active = true, AutoButtonColor = false, ZIndex = 40,
-}, screenGui)
-corner(toggleFab, 23)
-stroke(toggleFab, THEME.accent, 1.5)
-do
-	local dragging, moved = false, 0
-	local dragStart, startPos
-	toggleFab.InputBegan:Connect(function(io)
-		if io.UserInputType == Enum.UserInputType.MouseButton1
-			or io.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
-			moved = 0
-			dragStart = io.Position
-			startPos = toggleFab.Position
-		end
-	end)
-	local function onChange(io)
-		if not dragging then return end
-		if io.UserInputType == Enum.UserInputType.MouseMovement
-			or io.UserInputType == Enum.UserInputType.Touch then
-			local d = Vector2.new(io.Position.X - dragStart.X, io.Position.Y - dragStart.Y)
-			moved = d.Magnitude
-			toggleFab.Position = UDim2.new(
-				startPos.X.Scale, startPos.X.Offset + d.X,
-				startPos.Y.Scale, startPos.Y.Offset + d.Y)
-		end
-	end
-	toggleFab.InputChanged:Connect(onChange)
-	connect(uis.InputChanged, onChange)
-	connect(uis.InputEnded, function()
-		if dragging and moved <= 6 then
-			pingButton(toggleFab)
-			window.Visible = not window.Visible
-			if window.Visible then popWindow() end
-		end
-		dragging = false
-	end)
+local function tween(object, goal, duration, style, direction)
+    if not object then return nil end
+    if C.reduceAnim then
+        for key, value in pairs(goal) do object[key] = value end
+        return nil
+    end
+    local ok, tweenObject = pcall(function()
+        local created = TweenService:Create(object,
+            TweenInfo.new(duration or 0.18, style or Enum.EasingStyle.Quart,
+                direction or Enum.EasingDirection.Out), goal)
+        created:Play()
+        return created
+    end)
+    if ok then return tweenObject end
+    return nil
 end
 
--- TOP BAR
-local topBar = make("Frame", {
-	Name = "TopBar", Size = UDim2.new(1, 0, 0, 42),
-	BackgroundColor3 = THEME.surface, BorderSizePixel = 0,
-}, window)
-corner(topBar, 14)
-make("Frame", {
-	Size = UDim2.new(1, 0, 0, 10), Position = UDim2.new(0, 0, 1, -10),
-	BackgroundColor3 = THEME.surface, BorderSizePixel = 0,
-}, topBar)
-local accentBar = make("Frame", {
-	Size = UDim2.new(1, 0, 0, 2), Position = UDim2.new(0, 0, 1, -2),
-	BackgroundColor3 = THEME.accent, BorderSizePixel = 0,
-}, topBar)
-make("UIGradient", {
-	Color = ColorSequence.new({
-		ColorSequenceKeypoint.new(0, THEME.accent),
-		ColorSequenceKeypoint.new(0.6, THEME.accentDk),
-		ColorSequenceKeypoint.new(1, THEME.bg),
-	}),
-}, accentBar)
-make("TextLabel", {
-	Text = "RIOTHUB v4.0 · PRISON LIFE (LATEST)", Font = Enum.Font.GothamBold, TextSize = 14,
-	TextColor3 = THEME.text, BackgroundTransparency = 1,
-	Size = UDim2.new(1, -96, 1, 0), Position = UDim2.new(0, 14, 0, 0),
-	TextXAlignment = Enum.TextXAlignment.Left,
-}, topBar)
-local hideBtn = make("TextButton", {
-	Text = "-", Size = UDim2.new(0, 40, 1, 0), Position = UDim2.new(1, -84, 0, 0),
-	BackgroundTransparency = 1, Font = Enum.Font.GothamBold,
-	TextColor3 = THEME.textDim, TextSize = 18,
-}, topBar)
-local closeBtn = make("TextButton", {
-	Text = "X", Size = UDim2.new(0, 40, 1, 0), Position = UDim2.new(1, -44, 0, 0),
-	BackgroundTransparency = 1, Font = Enum.Font.GothamBold,
-	TextColor3 = THEME.accent, TextSize = 15,
-}, topBar)
-hideBtn.MouseButton1Click:Connect(function() window.Visible = false end)
-closeBtn.MouseButton1Click:Connect(function()
-	window.Visible = false
-	toast("Hub Hidden", "Tap the RH button or press RightCtrl to reopen", 2)
-end)
-enableDrag(window, topBar)
-
--- SIDEBAR + CONTENT
-local tabsRail = make("ScrollingFrame", {
-	Size = UDim2.new(0, 124, 1, -42 - 26), Position = UDim2.new(0, 0, 0, 42),
-	BackgroundTransparency = 1, BorderSizePixel = 0,
-	CanvasSize = UDim2.new(0, 0, 0, 340), ScrollBarThickness = 2,
-}, window)
-make("UIListLayout", { Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder }, tabsRail)
-pad(tabsRail, 6, 3, 6)
-
-local contentHolder = make("ScrollingFrame", {
-	Size = UDim2.new(1, -136, 1, -42 - 30),
-	Position = UDim2.new(0, 130, 0, 42),
-	BackgroundColor3 = THEME.surface, BorderSizePixel = 0,
-	CanvasSize = UDim2.new(0, 0, 0, 0), ScrollBarThickness = 3,
-	ScrollingDirection = Enum.ScrollingDirection.Y,
-}, window)
-corner(contentHolder, 10)
-pad(contentHolder, 4, 10, 6)
-
--- FOOTER + SESSION LOG
-local statusRow = make("Frame", {
-	Name = "StatusRow", Size = UDim2.new(1, 0, 0, 24),
-	Position = UDim2.new(0, 0, 1, -24), BackgroundTransparency = 1, ZIndex = 5,
-}, window)
-local statusLabel = make("TextLabel", {
-	Text = "ready...", Font = Enum.Font.Gotham, TextSize = 11,
-	TextColor3 = THEME.textDim, BackgroundTransparency = 1,
-	Size = UDim2.new(1, -90, 1, 0), Position = UDim2.new(0, 10, 0, 0),
-	TextXAlignment = Enum.TextXAlignment.Left,
-}, statusRow)
-local logBtn = make("TextButton", {
-	Text = "LOG +", Font = Enum.Font.GothamBold, TextSize = 11,
-	TextColor3 = THEME.text, BackgroundColor3 = THEME.card, BorderSizePixel = 0,
-	Size = UDim2.new(0, 70, 0, 18), Position = UDim2.new(1, -78, 0, 3),
-	AutoButtonColor = false,
-}, statusRow)
-corner(logBtn, 6)
-local logPanel = make("Frame", {
-	Name = "LogPanel", Size = UDim2.new(1, 0, 0, 80),
-	Position = UDim2.new(0, 0, 1, -80), BackgroundColor3 = THEME.bg,
-	BorderSizePixel = 0, Visible = false, ZIndex = 15,
-}, window)
-pad(logPanel, 6, 6, 2)
-logScroll = make("ScrollingFrame", {
-	Name = "LogScroll", Size = UDim2.new(1, -8, 1, -4),
-	BackgroundTransparency = 1, BorderSizePixel = 0,
-	CanvasSize = UDim2.new(0, 0, 0, 40), ScrollBarThickness = 2, ZIndex = 16,
-}, logPanel)
-logText = make("TextLabel", {
-	Name = "LogText", Text = "RiotHub v4.0 — session log",
-	Size = UDim2.new(1, -8, 0, 20), BackgroundTransparency = 1,
-	Font = Enum.Font.Code, TextColor3 = Color3.fromRGB(120, 235, 170),
-	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
-	TextSize = 12, ZIndex = 17,
-}, logScroll)
-local logOpen = false
-logBtn.MouseButton1Click:Connect(function()
-	logOpen = not logOpen
-	logBtn.Text = logOpen and "LOG -" or "LOG +"
-	logPanel.Visible = logOpen
-end)
-
--- TAB FRAMEWORK (FIXED REGISTRATION SO HOME OPENS AUTOMATICALLY)
-local tabButtons = {}
-local activeTabEntry = nil
-
-local function newTab(label)
-	local btn = make("TextButton", {
-		Text = label, Size = UDim2.new(1, 0, 0, 29),
-		BackgroundColor3 = THEME.bg,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		Font = Enum.Font.GothamBold, TextSize = 11,
-		TextColor3 = THEME.textDim,
-		AutoButtonColor = false, BorderSizePixel = 0,
-	}, tabsRail)
-	pad(btn, 10)
-	corner(btn, 8)
-	local bar = make("Frame", {
-		Size = UDim2.new(0, 3, 0, 14), Position = UDim2.new(0, 4, 0.5, -7),
-		BackgroundColor3 = THEME.accent, BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-	}, btn)
-	corner(bar, 2)
-
-	local page = make("Frame", {
-		Name = label:gsub("[^%a]", "") .. "Page",
-		Size = UDim2.new(1, -10, 1, 0),
-		BackgroundTransparency = 1, Visible = false,
-	}, contentHolder)
-	make("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, page)
-
-	local entry = { txt = btn, page = page, bar = bar }
-	tabButtons[label] = entry
-
-	btn.MouseButton1Click:Connect(function()
-		if activeTabEntry == entry then return end
-		if activeTabEntry then
-			activeTabEntry.page.Visible = false
-			activeTabEntry.txt.BackgroundColor3 = THEME.bg
-			activeTabEntry.txt.TextColor3 = THEME.textDim
-			activeTabEntry.bar.BackgroundTransparency = 1
-		end
-		activeTabEntry = entry
-		btn.BackgroundColor3 = THEME.card
-		btn.TextColor3 = THEME.text
-		entry.bar.BackgroundTransparency = 0
-		page.Visible = true
-		local list = page:FindFirstChildOfClass("UIListLayout")
-		contentHolder.CanvasSize = UDim2.new(0, 0, 0,
-			(list and list.AbsoluteContentSize.Y or 0) + 24)
-		contentHolder.CanvasPosition = Vector2.new(0, 0)
-	end)
-	return page
+local function slug(text)
+    local clean = string.lower(tostring(text)):gsub("[^%w]+", "_")
+    clean = clean:gsub("^_+", ""):gsub("_+$", "")
+    if clean == "" then clean = "item" end
+    return clean
 end
 
-local function ensureCanvas(page)
-	local list = page:FindFirstChildOfClass("UIListLayout")
-	if list then
-		local function sync()
-			if activeTabEntry and activeTabEntry.page == page then
-				contentHolder.CanvasSize = UDim2.new(0, 0, 0, list.AbsoluteContentSize.Y + 24)
-			end
-		end
-		connect(list:GetPropertyChangedSignal("AbsoluteContentSize"), sync)
-		if activeTabEntry and activeTabEntry.page == page then sync() end
-	end
+local function press(button)
+    if C.reduceAnim then return end
+    local scale = button:FindFirstChildOfClass("UIScale")
+    if not scale then scale = make("UIScale", { Scale = 1 }, button) end
+    tween(scale, { Scale = 0.96 }, 0.06)
+    task.delay(0.09, function()
+        if scale and scale.Parent then tween(scale, { Scale = 1 }, 0.12) end
+    end)
+end
+
+local function isPrimaryInput(input)
+    return input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+end
+
+-- One gesture owns the pointer until it ends. This is the fix for the old
+-- global `dragging` flag: a second finger cannot move a slider it never hit,
+-- and a lost InputEnded cannot leave a control stuck.
+function R.ui.beginDrag(input, onMove, onEnd)
+    if not (input and isPrimaryInput(input)) then return nil end
+    if S.activeDrag and S.activeDrag.stop then S.activeDrag.stop() end
+    local startType = input.UserInputType
+    local moveConnection, endConnection
+    local stopped = false
+    local handle = {}
+    S.activeDrag = handle
+    moveConnection = UIS.InputChanged:Connect(function(changed)
+        if stopped then return end
+        local matches
+        if startType == Enum.UserInputType.Touch then
+            -- Identity, not just type: a second finger must never move a
+            -- control it did not press.
+            matches = changed == input
+        else
+            matches = changed.UserInputType == Enum.UserInputType.MouseMovement
+        end
+        if matches then onMove(changed) end
+    end)
+    endConnection = UIS.InputEnded:Connect(function(ended)
+        if stopped then return end
+        local matches
+        if startType == Enum.UserInputType.Touch then
+            matches = ended == input
+        else
+            matches = ended.UserInputType == Enum.UserInputType.MouseButton1
+        end
+        if matches then
+            handle.stop()
+            if onEnd then onEnd() end
+        end
+    end)
+    table.insert(S.connections, moveConnection)
+    table.insert(S.connections, endConnection)
+    function handle.stop()
+        if stopped then return end
+        stopped = true
+        if moveConnection then pcall(function() moveConnection:Disconnect() end) end
+        if endConnection then pcall(function() endConnection:Disconnect() end) end
+        for index = #S.connections, 1, -1 do
+            local item = S.connections[index]
+            if item == moveConnection or item == endConnection then
+                table.remove(S.connections, index)
+            end
+        end
+        if S.activeDrag == handle then S.activeDrag = nil end
+    end
+    return handle
+end
+
+function R.ui.clampFrame(frame, margin)
+    if not frame then return end
+    local viewport = R.viewport()
+    local size = frame.AbsoluteSize
+    local width = size and size.X or 0
+    local height = size and size.Y or 0
+    if width <= 0 then width = frame.Size.X.Offset end
+    if height <= 0 then height = frame.Size.Y.Offset end
+    if width <= 0 or height <= 0 then return end
+    margin = margin or 12
+    local anchor = frame.AnchorPoint
+    local x = frame.Position.X.Offset - width * anchor.X
+    local y = frame.Position.Y.Offset - height * anchor.Y
+    x = math.clamp(x, margin, math.max(margin, viewport.X - width - margin))
+    y = math.clamp(y, margin, math.max(margin, viewport.Y - height - margin))
+    frame.Position = UDim2.new(0, x + width * anchor.X, 0, y + height * anchor.Y)
+end
+
+function R.ui.makeDraggable(handleObject, target, onClick)
+    R.connect(handleObject.InputBegan, function(input)
+        if not isPrimaryInput(input) then return end
+        local startAbsolute = target.AbsolutePosition
+        local startSize = target.AbsoluteSize
+        local width = (startSize and startSize.X or 0)
+        local height = (startSize and startSize.Y or 0)
+        if width <= 0 then width = target.Size.X.Offset end
+        if height <= 0 then height = target.Size.Y.Offset end
+        local anchor = target.AnchorPoint
+        local startInput = input.Position
+        local moved = false
+        R.ui.beginDrag(input, function(changed)
+            local delta = changed.Position - startInput
+            if delta.Magnitude > 5 then moved = true end
+            target.Position = UDim2.new(0,
+                startAbsolute.X + delta.X + width * anchor.X,
+                0,
+                startAbsolute.Y + delta.Y + height * anchor.Y)
+            R.ui.clampFrame(target, 12)
+        end, function()
+            if moved then
+                R.ui.clampFrame(target, 12)
+            elseif onClick then
+                onClick()
+            end
+        end)
+    end)
 end
 
 -- ============================================================================
--- UI WIDGET BUILDERS
+-- BASE BUILD
 -- ============================================================================
-local function section(page, label)
-	local row = make("Frame", {
-		Size = UDim2.new(1, -8, 0, 24), BackgroundTransparency = 1,
-	}, page)
-	make("TextLabel", {
-		Text = string.upper(label), Font = Enum.Font.GothamBold, TextSize = 11,
-		TextColor3 = THEME.accent, BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 1, 0), TextXAlignment = Enum.TextXAlignment.Left,
-	}, row)
-	make("Frame", {
-		Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 1, -2),
-		BackgroundColor3 = THEME.stroke, BackgroundTransparency = 0.6,
-		BorderSizePixel = 0,
-	}, row)
-end
+function R.ui.buildBase()
+    local playerGui = R.lp:FindFirstChild("PlayerGui")
+        or (R.lp.WaitForChild and R.lp:WaitForChild("PlayerGui", 10))
+    if not playerGui and gethui then
+        pcall(function() playerGui = gethui() end)
+    end
+    if not playerGui then
+        local okCore, coreGui = pcall(function() return game:FindFirstChildOfClass("CoreGui") end)
+        if okCore then playerGui = coreGui end
+    end
+    if not playerGui then
+        error("[RiotHub] no PlayerGui available for the UI", 0)
+    end
 
-local function infoRow(owner, text, height)
-	local row = make("TextLabel", {
-		Text = text, Font = Enum.Font.Gotham, TextSize = 11,
-		TextColor3 = THEME.textDim, BackgroundColor3 = THEME.card,
-		Size = UDim2.new(1, -8, 0, height or 42), TextWrapped = true, BorderSizePixel = 0,
-		TextXAlignment = Enum.TextXAlignment.Left,
-	}, owner)
-	corner(row, 8)
-	pad(row, 10, 10, 6, 6)
-	return row
-end
+    local screen = Instance.new("ScreenGui")
+    screen.Name = "RiotHubMobile_GUI"
+    screen.ResetOnSpawn = false
+    screen.IgnoreGuiInset = false
+    screen.DisplayOrder = 999
+    screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    local safeInsets = pcall(function()
+        screen.ScreenInsets = Enum.ScreenInsets.CoreUISafeInsets
+    end)
+    pcall(function() screen.ClipToDeviceSafeArea = true end)
+    if not safeInsets then
+        -- Old clients: IgnoreGuiInset=false still keeps us below the topbar.
+        screen.IgnoreGuiInset = false
+    end
+    screen.Parent = playerGui
+    S.ui.screen = screen
+    S.ui.safeInsets = safeInsets
 
-local function toggleRow(owner, id, label, desc, default, callback)
-	local row = make("TextButton", {
-		Size = UDim2.new(1, -8, 0, desc and desc ~= "" and 48 or 34),
-		BackgroundColor3 = THEME.card, BorderSizePixel = 0, Text = "",
-		AutoButtonColor = false, Parent = owner,
-	}, owner)
-	corner(row, 8)
-	local rowStroke = make("UIStroke", {
-		Color = THEME.accent, Thickness = 1.3, Transparency = 1,
-		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-	}, row)
-	local body = make("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, -56, 1, 0) }, row)
-	pad(body, 11)
-	make("TextLabel", {
-		Text = label, Size = UDim2.new(1, 0, 0, 18),
-		Position = UDim2.new(0, 0, 0, (desc and desc ~= "") and 4 or 8),
-		BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 12,
-		TextColor3 = THEME.text, TextXAlignment = Enum.TextXAlignment.Left,
-	}, body)
-	if desc and desc ~= "" then
-		make("TextLabel", {
-			Text = desc, Size = UDim2.new(1, 0, 0, 22), Position = UDim2.new(0, 0, 0, 22),
-			BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 10,
-			TextColor3 = THEME.textDim, TextXAlignment = Enum.TextXAlignment.Left,
-			TextWrapped = true,
-		}, body)
-	end
-	local switch = make("Frame", {
-		Size = UDim2.new(0, 40, 0, 22), Position = UDim2.new(1, -50, 0.5, -11),
-		BackgroundColor3 = default and THEME.green or Color3.fromRGB(52, 55, 66),
-		BorderSizePixel = 0,
-	}, row)
-	corner(switch, 11)
-	local knob = make("Frame", {
-		Size = UDim2.new(0, 16, 0, 16),
-		Position = default and UDim2.new(1, -19, 0, 3) or UDim2.new(0, 3, 0, 3),
-		BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
-	}, switch)
-	corner(knob, 8)
+    -- Scrim: closes the hub on a tap outside it (desktop) and stops game
+    -- camera drags behind the full-screen phone panel.
+    local scrim = make("TextButton", {
+        Name = "Scrim", Text = "", AutoButtonColor = false,
+        Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0),
+        BackgroundTransparency = 0.38, BorderSizePixel = 0,
+        Visible = false, ZIndex = 40,
+    }, screen)
+    scrim.MouseButton1Click:Connect(function()
+        if S.picker then R.ui.closePicker() else R.ui.openPanel(false) end
+    end)
+    S.ui.scrim = scrim
 
-	local enabled = (default == true)
-	local function set(v)
-		enabled = v == true
-		state.toggles[id] = enabled
-		switch.BackgroundColor3 = enabled and THEME.green or Color3.fromRGB(52, 55, 66)
-		rowStroke.Transparency = enabled and 0.35 or 1
-		knob.Position = enabled and UDim2.new(1, -19, 0, 3) or UDim2.new(0, 3, 0, 3)
-		tw(knob, { Position = knob.Position }, 0.1)
-		if statusLabel then
-			statusLabel.Text = label .. "  ->  " .. (enabled and "ON" or "OFF")
-		end
-		if callback then
-			task.spawn(function()
-				local ok, err = pcall(callback, enabled)
-				if not ok then log("toggle error [" .. id .. "]: " .. tostring(err), true) end
-			end)
-		end
-	end
-	row.MouseButton1Click:Connect(function() set(not enabled) end)
-	state.toggles[id] = enabled
-	state.switches[id] = { Set = set }
-	rowStroke.Transparency = enabled and 0.35 or 1
-	return { Set = set }
-end
+    local panel = make("Frame", {
+        Name = "Panel", BackgroundColor3 = THEME.bg, BorderSizePixel = 0,
+        ClipsDescendants = true, Active = true, ZIndex = 50,
+    }, screen)
+    corner(panel, 14)
+    stroke(panel, THEME.stroke, 1, 0.25)
+    S.ui.panel = panel
 
-local function sliderRow(owner, label, minV, maxV, default, callback, suffix)
-	local row = make("Frame", {
-		Size = UDim2.new(1, -8, 0, 44), BackgroundColor3 = THEME.card,
-		BorderSizePixel = 0,
-	}, owner)
-	corner(row, 8)
-	pad(row, 11, 12, 5)
-	make("TextLabel", {
-		Text = label, Size = UDim2.new(0.62, 0, 0, 16), BackgroundTransparency = 1,
-		Font = Enum.Font.GothamBold, TextSize = 12,
-		TextColor3 = THEME.text, TextXAlignment = Enum.TextXAlignment.Left,
-	}, row)
-	local valueLabel = make("TextLabel", {
-		Text = tostring(default) .. (suffix or ""), Size = UDim2.new(0.38, 0, 0, 16),
-		Position = UDim2.new(0.62, 0, 0, 0), BackgroundTransparency = 1,
-		Font = Enum.Font.GothamBold, TextSize = 12,
-		TextColor3 = THEME.accent, TextXAlignment = Enum.TextXAlignment.Right,
-	}, row)
-	local bar = make("Frame", {
-		Size = UDim2.new(1, 0, 0, 20), Position = UDim2.new(0, 0, 0, 22),
-		BackgroundTransparency = 1, Active = true,
-	}, row)
-	local track = make("Frame", {
-		Size = UDim2.new(1, 0, 0, 7), Position = UDim2.new(0, 0, 0.5, -3.5),
-		BackgroundColor3 = Color3.fromRGB(45, 48, 58), BorderSizePixel = 0,
-	}, bar)
-	corner(track, 3)
-	local ratio0 = math.clamp((default - minV) / math.max(maxV - minV, 0.001), 0, 1)
-	local fill = make("Frame", {
-		Size = UDim2.new(ratio0, 0, 1, 0),
-		BackgroundColor3 = THEME.accent, BorderSizePixel = 0,
-	}, track)
-	corner(fill, 3)
-	local knobDot = make("Frame", {
-		Size = UDim2.new(0, 12, 0, 12), AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.new(ratio0, 0, 0.5, 0),
-		BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
-	}, track)
-	corner(knobDot, 6)
-	local dragging = false
-	local function apply(x)
-		local a, s = bar.AbsolutePosition, bar.AbsoluteSize
-		local ratio = math.clamp((x - a.X) / math.max(s.X, 1), 0, 1)
-		local value = minV + (maxV - minV) * ratio
-		fill.Size = UDim2.new(ratio, 0, 1, 0)
-		knobDot.Position = UDim2.new(ratio, 0, 0.5, 0)
-		valueLabel.Text = string.format("%.0f%s", value, suffix or "")
-		if callback then
-			local ok, err = pcall(callback, value)
-			if not ok then log("slider error [" .. label .. "]: " .. tostring(err), true) end
-		end
-	end
-	bar.InputBegan:Connect(function(io)
-		if io.UserInputType == Enum.UserInputType.MouseButton1
-			or io.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
-			apply(io.Position.X)
-		end
-	end)
-	connect(uis.InputChanged, function(io)
-		if dragging and (io.UserInputType == Enum.UserInputType.MouseMovement
-			or io.UserInputType == Enum.UserInputType.Touch) then
-			apply(io.Position.X)
-		end
-	end)
-	connect(uis.InputEnded, function(io)
-		if io.UserInputType == Enum.UserInputType.MouseButton1
-			or io.UserInputType == Enum.UserInputType.Touch then
-			dragging = false
-		end
-	end)
-end
+    local header = make("Frame", {
+        Name = "Header", Size = UDim2.new(1, 0, 0, 54),
+        BackgroundColor3 = THEME.panel, BorderSizePixel = 0, ZIndex = 51,
+    }, panel)
+    S.ui.header = header
+    make("Frame", {
+        Name = "HeaderRule", Size = UDim2.new(1, 0, 0, 1),
+        Position = UDim2.new(0, 0, 1, -1), BackgroundColor3 = THEME.stroke,
+        BackgroundTransparency = 0.45, BorderSizePixel = 0, ZIndex = 52,
+    }, header)
 
-local function buttonRow(owner, label, callback, accent)
-	local btn = make("TextButton", {
-		Text = label, Size = UDim2.new(1, -8, 0, 34),
-		BackgroundColor3 = accent and Color3.fromRGB(48, 24, 34) or THEME.card,
-		Font = Enum.Font.GothamBold, TextSize = 12,
-		TextColor3 = accent and THEME.accent or THEME.text,
-		AutoButtonColor = false, BorderSizePixel = 0,
-	}, owner)
-	corner(btn, 8)
-	if accent then stroke(btn, THEME.accentDk, 1) end
-	btn.MouseButton1Click:Connect(function()
-		pingButton(btn)
-		if statusLabel then statusLabel.Text = label .. "  ->  fired" end
-		task.spawn(function()
-			local ok, err = pcall(callback)
-			if not ok then log("button error [" .. label .. "]: " .. tostring(err), true) end
-		end)
-	end)
-	return btn
-end
+    local title = make("TextLabel", {
+        Name = "Title", Text = "RIOT HUB", Size = UDim2.new(1, -80, 0, 20),
+        Position = UDim2.fromOffset(16, 7), BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBlack, TextSize = 16, TextColor3 = THEME.text,
+        TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 52,
+    }, header)
+    S.ui.title = title
 
-local function pairRow(owner, labelA, cbA, labelB, cbB)
-	local rowWrap = make("Frame", {
-		Size = UDim2.new(1, -8, 0, 34), BackgroundTransparency = 1,
-	}, owner)
-	local a = make("TextButton", {
-		Text = labelA, Size = UDim2.new(0.5, -4, 1, 0),
-		BackgroundColor3 = THEME.card, BorderSizePixel = 0,
-		Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = THEME.text,
-		AutoButtonColor = false,
-	}, rowWrap)
-	corner(a, 8)
-	a.MouseButton1Click:Connect(function()
-		pingButton(a)
-		task.spawn(function()
-			local ok, err = pcall(cbA)
-			if not ok then log("button error [" .. labelA .. "]: " .. tostring(err), true) end
-		end)
-	end)
-	local b = make("TextButton", {
-		Text = labelB, Size = UDim2.new(0.5, -4, 1, 0), Position = UDim2.new(0.5, 4, 0, 0),
-		BackgroundColor3 = THEME.card, BorderSizePixel = 0,
-		Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = THEME.text,
-		AutoButtonColor = false,
-	}, rowWrap)
-	corner(b, 8)
-	b.MouseButton1Click:Connect(function()
-		pingButton(b)
-		task.spawn(function()
-			local ok, err = pcall(cbB)
-			if not ok then log("button error [" .. labelB .. "]: " .. tostring(err), true) end
-		end)
-	end)
-end
+    local dot = make("Frame", {
+        Name = "StatusDot", Size = UDim2.fromOffset(7, 7),
+        Position = UDim2.fromOffset(16, 33), BackgroundColor3 = THEME.warn,
+        BorderSizePixel = 0, ZIndex = 52,
+    }, header)
+    corner(dot, 4)
+    S.ui.statusDot = dot
 
--- FIXED DROPDOWN (Y-OFFSET POSITIONING + DYNAMIC REBUILD FOR PLAYER LISTS)
-local function dropdownRow(owner, label, options, default, callback)
-	local baseH = 34
-	local row = make("TextButton", {
-		Size = UDim2.new(1, -8, 0, baseH), BackgroundColor3 = THEME.card,
-		BorderSizePixel = 0, AutoButtonColor = false, Text = "", ZIndex = 4,
-	}, owner)
-	corner(row, 8)
-	pad(row, 11)
-	make("TextLabel", {
-		Text = label, Size = UDim2.new(0.55, -8, 0, baseH),
-		BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 12,
-		TextColor3 = THEME.text, TextXAlignment = Enum.TextXAlignment.Left,
-	}, row)
-	local chosen = make("TextLabel", {
-		Text = (default or "-"), Size = UDim2.new(0.45, -12, 0, baseH),
-		Position = UDim2.new(0.55, 0, 0, 0), BackgroundTransparency = 1,
-		Font = Enum.Font.GothamBold, TextSize = 12,
-		TextColor3 = THEME.accent, TextXAlignment = Enum.TextXAlignment.Right,
-	}, row)
-	local list = make("ScrollingFrame", {
-		Size = UDim2.new(1, 0, 0, 120),
-		BackgroundColor3 = Color3.fromRGB(32, 35, 45), BorderSizePixel = 0,
-		Position = UDim2.new(0, 0, 0, baseH + 4), Visible = false, ZIndex = 12,
-		ScrollBarThickness = 2, CanvasSize = UDim2.new(0, 0, 0, 0),
-	}, row)
-	corner(list, 8)
-	stroke(list, THEME.stroke)
+    local subtitle = make("TextLabel", {
+        Name = "Subtitle", Text = "MOBILE v4.0 · starting",
+        Size = UDim2.new(1, -96, 0, 15), Position = UDim2.fromOffset(28, 29),
+        BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11,
+        TextColor3 = THEME.dim, TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 52,
+    }, header)
+    S.ui.subtitle = subtitle
 
-	local openTgl = false
-	local currentOpts = options or {}
+    local close = make("TextButton", {
+        Name = "CloseButton", Text = "✕", Size = UDim2.fromOffset(44, 44),
+        Position = UDim2.new(1, -52, 0, 5), BackgroundColor3 = THEME.card,
+        Font = Enum.Font.GothamBold, TextSize = 18, TextColor3 = THEME.text,
+        AutoButtonColor = false, BorderSizePixel = 0, ZIndex = 53,
+    }, header)
+    corner(close, 11)
+    close.MouseButton1Click:Connect(function() R.ui.openPanel(false) end)
+    S.ui.close = close
 
-	local function setOpen(open)
-		openTgl = open
-		local listH = math.min(#currentOpts, 6) * 26 + 6
-		list.Size = UDim2.new(1, 0, 0, listH)
-		list.CanvasSize = UDim2.new(0, 0, 0, #currentOpts * 26 + 6)
-		list.Visible = open
-		row.Size = UDim2.new(1, -8, 0, baseH + (open and (listH + 8) or 0))
-		row.ZIndex = open and 11 or 4
-	end
+    local tabHolder = make("ScrollingFrame", {
+        Name = "Tabs", BackgroundTransparency = 1, BorderSizePixel = 0,
+        ScrollBarThickness = 0, CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.X, ScrollingDirection = Enum.ScrollingDirection.X,
+        ZIndex = 52, ClipsDescendants = true,
+    }, panel)
+    S.ui.tabHolder = tabHolder
+    local tabLayout = make("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 6),
+        VerticalAlignment = Enum.VerticalAlignment.Center,
+        HorizontalAlignment = Enum.HorizontalAlignment.Left,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, tabHolder)
+    S.ui.tabLayout = tabLayout
+    pad(tabHolder, 8, 8, 4, 4)
 
-	local function rebuildOptions(newOpts)
-		currentOpts = newOpts or {}
-		for _, ch in ipairs(list:GetChildren()) do
-			if ch:IsA("TextButton") then ch:Destroy() end
-		end
-		for idx, opt in ipairs(currentOpts) do
-			local optBtn = make("TextButton", {
-				Text = tostring(opt), Size = UDim2.new(1, -8, 0, 24),
-				Position = UDim2.new(0, 4, 0, (idx - 1) * 26 + 3), -- FIXED Y-OFFSET!
-				BackgroundColor3 = Color3.fromRGB(40, 44, 56),
-				Font = Enum.Font.Gotham, TextSize = 11,
-				TextColor3 = THEME.text, AutoButtonColor = false,
-				BorderSizePixel = 0, ZIndex = 13,
-				TextXAlignment = Enum.TextXAlignment.Left,
-			}, list)
-			pad(optBtn, 8, 0, 0)
-			corner(optBtn, 6)
-			optBtn.MouseButton1Click:Connect(function()
-				chosen.Text = tostring(opt)
-				if callback then callback(opt) end
-				setOpen(false)
-			end)
-		end
-	end
+    local pageHost = make("Frame", {
+        Name = "PageHost", BackgroundTransparency = 1,
+        ClipsDescendants = true, ZIndex = 51,
+    }, panel)
+    S.ui.pageHost = pageHost
 
-	rebuildOptions(currentOpts)
-	row.MouseButton1Click:Connect(function()
-		setOpen(not openTgl)
-	end)
-	return { Text = chosen, SetOptions = rebuildOptions, SetValue = function(v) chosen.Text = tostring(v) end }
-end
+    -- Quick dock: vertical on tall screens, horizontal on short landscape.
+    local dock = make("Frame", {
+        Name = "QuickDock", BackgroundColor3 = THEME.panel,
+        BackgroundTransparency = 0.06, BorderSizePixel = 0,
+        Visible = false, ZIndex = 60,
+    }, screen)
+    corner(dock, 14)
+    stroke(dock, THEME.accent, 1.2, 0.45)
+    local dockLayout = make("UIListLayout", {
+        FillDirection = Enum.FillDirection.Vertical,
+        Padding = UDim.new(0, 6),
+        HorizontalAlignment = Enum.HorizontalAlignment.Center,
+        VerticalAlignment = Enum.VerticalAlignment.Center,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, dock)
+    pad(dock, 6, 6, 6, 6)
+    S.ui.dock = dock
+    S.ui.dockLayout = dockLayout
+    S.ui.dockButtons = {}
 
--- ============================================================================
--- TABS CREATION
--- ============================================================================
-local pageHome   = newTab("HOME")
-local pageCombat = newTab("COMBAT")
-local pageTarget = newTab("TARGET")
-local pageGun    = newTab("GUNS")
-local pageMov    = newTab("MOVE & CAR")
-local pageVis    = newTab("VISUALS")
-local pageTele   = newTab("TELEPORT")
-local pageSrv    = newTab("WORLD")
-local pageCfg    = newTab("SETUP")
+    local function dockButton(name, label, callback)
+        local button = make("TextButton", {
+            Name = "Quick_" .. name, Text = label, Size = UDim2.fromOffset(48, 48),
+            BackgroundColor3 = THEME.card, Font = Enum.Font.GothamBold,
+            TextSize = 11, TextColor3 = THEME.text, AutoButtonColor = false,
+            BorderSizePixel = 0, ZIndex = 61,
+        }, dock)
+        corner(button, 11)
+        button.MouseButton1Click:Connect(function()
+            press(button)
+            R.safe("quick " .. name, callback)
+        end)
+        S.ui.dockButtons[name] = button
+        return button
+    end
 
-for _, p in ipairs({
-	pageHome, pageCombat, pageTarget, pageGun,
-	pageMov, pageVis, pageTele, pageSrv, pageCfg
-}) do
-	ensureCanvas(p)
-end
+    dockButton("menu", "MENU", function() R.ui.openPanel(true) end)
+    dockButton("aura", "AURA", function()
+        if S.switches.auraKillOn then S.switches.auraKillOn.Set(not S.toggles.auraKillOn) end
+    end)
+    dockButton("aim", "AIM", function()
+        if not S.toggles.aimOn then
+            if S.switches.aimOn then S.switches.aimOn.Set(true) end
+            S.aimHeld = true
+        else
+            S.aimHeld = not S.aimHeld
+        end
+        R.ui.syncDock()
+        R.toast("Aim assist", S.aimHeld and "engaged" or "released", 1.4,
+            S.aimHeld and "ok" or "warn")
+    end)
+    dockButton("fly", "FLY", function()
+        if S.switches.flyOn then S.switches.flyOn.Set(not S.toggles.flyOn) end
+    end)
 
--- Activate HOME tab immediately on launch
-do
-	local first = tabButtons["HOME"]
-	if first then
-		activeTabEntry = first
-		first.txt.BackgroundColor3 = THEME.card
-		first.txt.TextColor3 = THEME.text
-		first.bar.BackgroundTransparency = 0
-		first.page.Visible = true
-	end
+    local orb = make("TextButton", {
+        Name = "Orb", Text = "RH", Size = UDim2.fromOffset(54, 54),
+        BackgroundColor3 = THEME.panel, Font = Enum.Font.GothamBlack,
+        TextSize = 15, TextColor3 = THEME.accent, AutoButtonColor = false,
+        BorderSizePixel = 0, ZIndex = 60, Visible = false,
+    }, screen)
+    corner(orb, 27)
+    stroke(orb, THEME.accent, 1.6, 0.25)
+    gradient(orb, THEME.accent, THEME.violet, 45)
+    R.ui.makeDraggable(orb, orb, function() R.ui.openPanel(true) end)
+    S.ui.orb = orb
+
+    local function flyButton(name, label, lift)
+        local button = make("TextButton", {
+            Name = name, Text = label, Size = UDim2.fromOffset(48, 48),
+            BackgroundColor3 = THEME.panel, BackgroundTransparency = 0.05,
+            Font = Enum.Font.GothamBold, TextSize = 18, TextColor3 = THEME.accent,
+            AutoButtonColor = false, BorderSizePixel = 0, ZIndex = 60,
+            Visible = false,
+        }, screen)
+        corner(button, 12)
+        stroke(button, THEME.accent, 1.2, 0.4)
+        R.connect(button.InputBegan, function(input)
+            if isPrimaryInput(input) then S.flyLift = lift end
+        end)
+        R.connect(button.InputEnded, function(input)
+            if isPrimaryInput(input) then S.flyLift = 0 end
+        end)
+        return button
+    end
+    S.ui.flyUp = flyButton("FlyUp", "▲", 1)
+    S.ui.flyDown = flyButton("FlyDown", "▼", -1)
+
+    local toastHolder = make("Frame", {
+        Name = "Toasts", BackgroundTransparency = 1, ZIndex = 100,
+        Size = UDim2.new(0, 320, 0, 0),
+    }, screen)
+    make("UIListLayout", {
+        FillDirection = Enum.FillDirection.Vertical,
+        Padding = UDim.new(0, 6),
+        HorizontalAlignment = Enum.HorizontalAlignment.Center,
+        VerticalAlignment = Enum.VerticalAlignment.Top,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, toastHolder)
+    S.ui.toastHolder = toastHolder
+    S.ui.toasts = {}
+
+    R.toast = function(titleText, body, duration, kind)
+        if S.detached or not S.ui.toastHolder then return end
+        local color = kind == "err" and THEME.danger
+            or (kind == "warn" and THEME.warn or THEME.good)
+        local card = make("Frame", {
+            Size = UDim2.new(1, 0, 0, 54), BackgroundColor3 = THEME.panel,
+            BorderSizePixel = 0, ZIndex = 101,
+        }, S.ui.toastHolder)
+        corner(card, 12)
+        stroke(card, color, 1.2, 0.2)
+        make("Frame", {
+            Size = UDim2.new(0, 3, 1, -16), Position = UDim2.new(0, 0, 0, 8),
+            BackgroundColor3 = color, BorderSizePixel = 0, ZIndex = 102,
+        }, card)
+        make("TextLabel", {
+            Text = string.upper(tostring(titleText)), Size = UDim2.new(1, -28, 0, 17),
+            Position = UDim2.fromOffset(12, 5), BackgroundTransparency = 1,
+            Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = color,
+            TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 102,
+        }, card)
+        make("TextLabel", {
+            Text = tostring(body or ""), Size = UDim2.new(1, -24, 0, 27),
+            Position = UDim2.fromOffset(12, 22), BackgroundTransparency = 1,
+            Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = THEME.text,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true, ZIndex = 102,
+        }, card)
+        local scale = make("UIScale", { Scale = C.reduceAnim and 1 or 0.92 }, card)
+        if not C.reduceAnim then tween(scale, { Scale = 1 }, 0.16) end
+        table.insert(S.ui.toasts, card)
+        while #S.ui.toasts > 3 do
+            local oldest = table.remove(S.ui.toasts, 1)
+            if oldest then oldest:Destroy() end
+        end
+        task.delay(duration or 3, function()
+            if not card or not card.Parent then return end
+            for index, item in ipairs(S.ui.toasts) do
+                if item == card then table.remove(S.ui.toasts, index) break end
+            end
+            card:Destroy()
+        end)
+    end
+
+    -- Picker layer (modal dropdown / bottom sheet).
+    local pickerScrim = make("TextButton", {
+        Name = "PickerScrim", Text = "", AutoButtonColor = false,
+        Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0),
+        BackgroundTransparency = 0.42, BorderSizePixel = 0,
+        Visible = false, ZIndex = 200,
+    }, screen)
+    pickerScrim.MouseButton1Click:Connect(function() R.ui.closePicker() end)
+    S.ui.pickerScrim = pickerScrim
+
+    local picker = make("Frame", {
+        Name = "Picker", BackgroundColor3 = THEME.panel, BorderSizePixel = 0,
+        Visible = false, ZIndex = 201, ClipsDescendants = true,
+    }, screen)
+    corner(picker, 16)
+    stroke(picker, THEME.accent, 1.4, 0.25)
+    S.ui.picker = picker
+
+    local pickerTitle = make("TextLabel", {
+        Name = "PickerTitle", Text = "Choose", Size = UDim2.new(1, -76, 0, 22),
+        Position = UDim2.fromOffset(16, 12), BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold, TextSize = 15, TextColor3 = THEME.text,
+        TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 202,
+    }, picker)
+    S.ui.pickerTitle = pickerTitle
+    local pickerClose = make("TextButton", {
+        Name = "PickerClose", Text = "✕", Size = UDim2.fromOffset(44, 44),
+        Position = UDim2.new(1, -56, 0, 4), BackgroundColor3 = THEME.card,
+        Font = Enum.Font.GothamBold, TextSize = 16, TextColor3 = THEME.text,
+        AutoButtonColor = false, BorderSizePixel = 0, ZIndex = 203,
+    }, picker)
+    corner(pickerClose, 10)
+    pickerClose.MouseButton1Click:Connect(function() R.ui.closePicker() end)
+
+    local pickerScroll = make("ScrollingFrame", {
+        Name = "PickerList", BackgroundTransparency = 1, BorderSizePixel = 0,
+        ScrollBarThickness = 4, ScrollBarImageColor3 = THEME.accent,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollingDirection = Enum.ScrollingDirection.Y, ZIndex = 202,
+    }, picker)
+    make("UIListLayout", {
+        Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder,
+    }, pickerScroll)
+    pad(pickerScroll, 10, 10, 2, 10)
+    S.ui.pickerScroll = pickerScroll
+
+    R.ui.layoutPicker()
+    R.ui.layout()
+    R.ui.syncOverlay()
 end
 
 -- ============================================================================
--- 1) HOME PAGE
+-- PAGES AND TABS
 -- ============================================================================
-section(pageHome, "One-Tap Power Actions")
-pairRow(pageHome, "Get All Guns + Mod", function() giveAllLoot(true) end,
-	"Kill All (Server)", function() killAll(CONFIG.killAuraMode) end)
-pairRow(pageHome, "Arrest All", function() arrestAll() end,
-	"Taze All", function() tazeAll() end)
-pairRow(pageHome, "Open Prison Gate", function() openGate() end,
-	"Spawn Car Here", function() spawnCarHere("Sedan") end)
-pairRow(pageHome, "Refresh In Place (:re)", function() refreshCharacterInPlace() end,
-	"Fling All Players", function() flingAll() end)
+function R.ui.addPage(id, label)
+    local page = make("ScrollingFrame", {
+        Name = "Page_" .. id, BackgroundTransparency = 1, BorderSizePixel = 0,
+        Size = UDim2.fromScale(1, 1), Visible = false,
+        ScrollBarThickness = 4, ScrollBarImageColor3 = THEME.accent,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ClipsDescendants = true, ZIndex = 51,
+    }, S.ui.pageHost)
+    make("UIListLayout", {
+        Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder,
+    }, page)
+    pad(page, 0, 0, 6, 18)
 
-section(pageHome, "Quick Team Switch")
-pairRow(pageHome, "Become Guard", function() switchTeam("Guard") end,
-	"Become Inmate", function() switchTeam("Inmate") end)
-pairRow(pageHome, "Become Criminal", function() switchTeam("Criminal") end,
-	"Solo Neutral", function() switchTeam("Neutral") end)
+    local button = make("TextButton", {
+        Name = "Tab_" .. id, Text = label, Size = UDim2.fromOffset(94, 46),
+        BackgroundColor3 = THEME.card, BackgroundTransparency = 0.35,
+        Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = THEME.dim,
+        AutoButtonColor = false, BorderSizePixel = 0, ZIndex = 52,
+    }, S.ui.tabHolder)
+    corner(button, 10)
+    button.MouseButton1Click:Connect(function()
+        press(button)
+        R.ui.selectTab(id)
+    end)
 
-section(pageHome, "Live Session Telemetry")
-local statFrame = make("Frame", {
-	Size = UDim2.new(1, -8, 0, 42), BackgroundColor3 = THEME.card, BorderSizePixel = 0,
-}, pageHome)
-corner(statFrame, 8)
-local statKills = make("TextLabel", {
-	Text = "0 kills/hits", Font = Enum.Font.GothamBold, TextSize = 12,
-	TextColor3 = THEME.accent, BackgroundTransparency = 1,
-	Size = UDim2.new(0.34, 0, 1, 0),
-}, statFrame)
-local statArrests = make("TextLabel", {
-	Text = "0 cuffs", Font = Enum.Font.GothamBold, TextSize = 12,
-	TextColor3 = THEME.green, BackgroundTransparency = 1,
-	Size = UDim2.new(0.33, 0, 1, 0), Position = UDim2.new(0.34, 0, 0, 0),
-}, statFrame)
-local statItems = make("TextLabel", {
-	Text = "0 items", Font = Enum.Font.GothamBold, TextSize = 12,
-	TextColor3 = THEME.amber, BackgroundTransparency = 1,
-	Size = UDim2.new(0.33, 0, 1, 0), Position = UDim2.new(0.67, 0, 0, 0),
-}, statFrame)
-
-infoRow(pageHome, "CHAT COMMANDS ACTIVE! Type in Roblox Chat:\n"
-	.. ":kill [plr/all] · :loopkill [plr] · :unloopkill [plr] · :fling [plr/all] · :arrest [plr/all]\n"
-	.. ":taze [plr/all] · :goto [plr] · :view [plr] · :unview · :guns · :mod · :car · :re · :crim · :guard", 62)
-
--- ============================================================================
--- 2) COMBAT PAGE
--- ============================================================================
-section(pageCombat, "Kill Aura & Super Punch")
-toggleRow(pageCombat, "auraKillOn", "Kill Aura (Key: G)", "Auto-kills every target in radius using Smart/Gun/Fists",
-	false, function(v) if v then toast("Kill Aura", "Active (" .. CONFIG.killAuraMode .. ")", 2, "ok") end end)
-toggleRow(pageCombat, "superPunchOn", "Super Punch / One-Punch (Key: F)", "1-hit KO with bare fists (shows PUNCH button on mobile)",
-	false, function(v)
-		CONFIG.superPunch = v
-		punchFab.Visible = v
-		if v then toast("Super Punch", "Press F or tap PUNCH to 1-hit KO nearby players!", 2.5, "ok") end
-	end)
-sliderRow(pageCombat, "Kill Aura Radius", 10, 260, CONFIG.killAuraRadius,
-	function(v) CONFIG.killAuraRadius = math.floor(v + 0.5) end, " studs")
-sliderRow(pageCombat, "Kill Aura Pace", 5, 100, math.floor(CONFIG.killAuraRate * 100),
-	function(v) CONFIG.killAuraRate = math.max(v / 100, 0.05) end, " cs")
-dropdownRow(pageCombat, "Kill Engine Mode", { "Smart (Gun + Fists)", "Gun", "Fists" }, CONFIG.killAuraMode,
-	function(choice) CONFIG.killAuraMode = choice end)
-dropdownRow(pageCombat, "Aura Target Filter", { "All", "Inmates", "Guards", "Criminals", "Non-Friends" }, CONFIG.auraTargets,
-	function(choice) CONFIG.auraTargets = choice end)
-toggleRow(pageCombat, "skipFF", "Ignore Spawn ForceFields", "Skip freshly spawned shielded players",
-	CONFIG.killAuraIgnoreFF, function(v) CONFIG.killAuraIgnoreFF = v end)
-
-section(pageCombat, "Hitbox Expander")
-toggleRow(pageCombat, "hitboxOn", "Expand Enemy Hitboxes", "Enlarges enemy heads/roots so every shot & punch lands",
-	false, function(v) CONFIG.hitboxEnabled = v end)
-sliderRow(pageCombat, "Hitbox Size", 2, 25, CONFIG.hitboxSize,
-	function(v) CONFIG.hitboxSize = math.floor(v + 0.5) end, " studs")
-dropdownRow(pageCombat, "Hitbox Target Part", { "Head", "HumanoidRootPart" }, CONFIG.hitboxPart,
-	function(choice) CONFIG.hitboxPart = choice end)
-
-section(pageCombat, "Aimbot & Silent Aim")
-toggleRow(pageCombat, "aimOn", "Camera Aimbot", "Locks camera onto nearest head inside FOV ring",
-	false, function() end)
-sliderRow(pageCombat, "Aimbot FOV", 20, 450, CONFIG.aimbotFov,
-	function(v) CONFIG.aimbotFov = math.floor(v + 0.5) end)
-sliderRow(pageCombat, "Aimbot Smoothing", 0, 95, CONFIG.aimbotSmooth,
-	function(v) CONFIG.aimbotSmooth = v end, "%")
-toggleRow(pageCombat, "silentOn", "Silent Aim (ShootEvent Hook)", "Redirects your gun bullets directly to the nearest enemy Head",
-	false, function() end)
-sliderRow(pageCombat, "Silent Aim Hit Chance", 0, 100, CONFIG.silentHitChance,
-	function(v) CONFIG.silentHitChance = math.floor(v + 0.5) end, "%")
-toggleRow(pageCombat, "silentWall", "Silent Aim Wall Check", "Only redirect bullets when target is in line of sight",
-	CONFIG.silentWallCheck, function(v) CONFIG.silentWallCheck = v end)
-toggleRow(pageCombat, "triggerOn", "TriggerBot", "Auto-fires held weapon when crosshair passes over an enemy",
-	false, function() end)
-dropdownRow(pageCombat, "Aim Target Filter", { "All", "Inmates", "Guards", "Criminals", "Non-Friends" }, CONFIG.aimbotTargets,
-	function(choice) CONFIG.aimbotTargets = choice; CONFIG.triggerTargets = choice end)
-
-section(pageCombat, "Arrest & Taze Auras")
-toggleRow(pageCombat, "auraArrestOn", "Arrest Aura (Key: H)", "Auto-snaps behind & cuffs any arrestable player in range",
-	false, function(v) if v then toast("Arrest Aura", "Active — cuffs inmates & criminals", 2, "ok") end end)
-sliderRow(pageCombat, "Arrest Radius", 15, 400, CONFIG.arrestAuraRadius,
-	function(v) CONFIG.arrestAuraRadius = math.floor(v + 0.5) end, " studs")
-toggleRow(pageCombat, "clickArrestOn", "Click Arrest", "Tap/click any player on screen to cuff them",
-	CONFIG.clickArrest, function(v) CONFIG.clickArrest = v end)
-toggleRow(pageCombat, "auraTazeOn", "Taze Loop Aura (Key: J)", "Continuously remote-tazes non-guards across the server",
-	false, function() end)
-
--- ============================================================================
--- 3) TARGET PLAYER MANAGER & TROLL SUITE
--- ============================================================================
-section(pageTarget, "Select Player")
-local function buildPlayerNames()
-	local names = {}
-	for _, p in ipairs(plrs:GetPlayers()) do
-		if p ~= lp then table.insert(names, p.Name) end
-	end
-	if #names == 0 then table.insert(names, "(No other players)") end
-	return names
+    S.ui.pages = S.ui.pages or {}
+    S.ui.tabs = S.ui.tabs or {}
+    S.ui.pageOrder = S.ui.pageOrder or {}
+    table.insert(S.ui.pageOrder, id)
+    S.ui.pages[id] = { page = page, button = button, label = label }
+    S.ui.tabs[id] = button
+    return page
 end
 
-local targetDropdown = dropdownRow(pageTarget, "Target Player", buildPlayerNames(), "-", function(choice)
-	local p = plrs:FindFirstChild(choice)
-	if p then
-		state.selectedTarget = p
-		toast("Target Selected", p.Name .. " (" .. tostring(p.Team and p.Team.Name or "Neutral") .. ")", 1.8, "ok")
-	end
-end)
-
-local function refreshTargetDropdown()
-	local names = buildPlayerNames()
-	targetDropdown.SetOptions(names)
-	if not getActiveTarget() and names[1] and names[1] ~= "(No other players)" then
-		state.selectedTarget = plrs:FindFirstChild(names[1])
-		targetDropdown.SetValue(names[1])
-	end
+function R.ui.selectTab(id)
+    if not S.ui.pages or not S.ui.pages[id] then return end
+    S.activeTab = id
+    for pageId, entry in pairs(S.ui.pages) do
+        local active = pageId == id
+        entry.page.Visible = active
+        entry.button.BackgroundColor3 = active and THEME.accentDark or THEME.card
+        entry.button.BackgroundTransparency = active and 0.05 or 0.35
+        entry.button.TextColor3 = active and THEME.accent or THEME.dim
+        if active then entry.page.CanvasPosition = Vector2.new(0, 0) end
+    end
 end
 
-pairRow(pageTarget, "Refresh Player List", function()
-	refreshTargetDropdown()
-	toast("Players Refreshed", tostring(#plrs:GetPlayers() - 1) .. " other players", 1.5, "ok")
-end, "Select Nearest Player", function()
-	local myRoot = charRoot()
-	if not myRoot then return end
-	local best, bestD = nil, math.huge
-	for _, p in ipairs(plrs:GetPlayers()) do
-		if p ~= lp and charRoot(p) then
-			local d = (charRoot(p).Position - myRoot.Position).Magnitude
-			if d < bestD then best, bestD = p, d end
-		end
-	end
-	if best then
-		state.selectedTarget = best
-		targetDropdown.SetValue(best.Name)
-		toast("Nearest Selected", best.Name .. string.format(" (%.0fm)", bestD), 1.8, "ok")
-	end
-end)
-
-section(pageTarget, "Single-Target Actions")
-pairRow(pageTarget, "Kill Target (Smart)", function()
-	local t = getActiveTarget()
-	if not t then toast("No Target", "Select a player above first", 2, "err") return end
-	killTarget(t)
-	toast("Kill Fired", "Attacked " .. t.Name, 1.8, "ok")
-end, "TP-Punch Kill (No Gun)", function()
-	local t = getActiveTarget()
-	if not t then toast("No Target", "Select a player above first", 2, "err") return end
-	tpPunchKill(t)
-	toast("TP-Punch Kill", "Punched " .. t.Name .. " 15x", 1.8, "ok")
-end)
-
-pairRow(pageTarget, "Fling Target (Launch)", function()
-	local t = getActiveTarget()
-	if not t then toast("No Target", "Select a player above first", 2, "err") return end
-	flingTarget(t, 1.8)
-end, "Arrest Target", function()
-	local t = getActiveTarget()
-	if not t then toast("No Target", "Select a player above first", 2, "err") return end
-	if arrestTarget(t) then
-		toast("Arrested", t.Name .. " is now cuffed!", 2, "ok")
-	else
-		toast("Arrest Failed", "Target is a Guard or already cuffed", 2, "err")
-	end
-end)
-
-pairRow(pageTarget, "Taze Target", function()
-	local t = getActiveTarget()
-	if not t then toast("No Target", "Select a player above first", 2, "err") return end
-	if tazeTarget(t) then
-		toast("Tazed", "Shocked " .. t.Name, 1.8, "ok")
-	else
-		toast("No Taser", "Switch to Guard team for a Taser", 2, "err")
-	end
-end, "Teleport To Target", function()
-	local t = getActiveTarget()
-	local r = t and charRoot(t)
-	if r then
-		teleportTo(r.CFrame * CFrame.new(0, 0, 2.5))
-		toast("Teleported", "Warped behind " .. t.Name, 1.5, "ok")
-	end
-end)
-
-section(pageTarget, "Target Persistent Loops & Spectate")
-toggleRow(pageTarget, "loopKillTargetOn", "Loopkill Selected Target", "Automatically kills the selected target every time they respawn",
-	false, function(v)
-		local t = getActiveTarget()
-		if t then
-			state.loopKillTargets[t.Name] = v and true or nil
-			toast("Loopkill", (v and "Locked onto " or "Stopped on ") .. t.Name, 2, v and "ok" or nil)
-		end
-	end)
-toggleRow(pageTarget, "loopTazeTargetOn", "Loop-Taze Selected Target", "Continuously tazes the selected target so they stay stunned",
-	false, function(v)
-		local t = getActiveTarget()
-		if t then
-			state.loopTazeTargets[t.Name] = v and true or nil
-		end
-	end)
-toggleRow(pageTarget, "orbitTargetOn", "Orbit / Annoy Target", "Circles rapidly around the selected target player",
-	false, function() end)
-toggleRow(pageTarget, "spectateTargetOn", "Spectate / View Target", "Locks your camera onto the selected target",
-	false, function(v)
-		local cam = currentCam()
-		if not cam then return end
-		if v then
-			local t = getActiveTarget()
-			local hum = t and charHumanoid(t)
-			if hum then cam.CameraSubject = hum end
-		else
-			local myHum = charHumanoid()
-			if myHum then cam.CameraSubject = myHum end
-		end
-	end)
-buttonRow(pageTarget, "Clear All Loopkills & Loop-Tazes", function()
-	state.loopKillTargets = {}
-	state.loopTazeTargets = {}
-	if state.switches.loopKillTargetOn then state.switches.loopKillTargetOn.Set(false) end
-	if state.switches.loopTazeTargetOn then state.switches.loopTazeTargetOn.Set(false) end
-	toast("Cleared", "All loopkill & loop-taze targets cleared", 2, "ok")
-end)
-
--- ============================================================================
--- 4) GUNS & ITEM HANDLER PAGE
--- ============================================================================
-section(pageGun, "Weapon Giver (Distance-Bypass Ready)")
-dropdownRow(pageGun, "Pickup Bypass Method",
-	{ "Smart Snap + Spoof", "CFrame Snap-Back", "Remote Spoof Only" },
-	CONFIG.pickupMethod, function(choice) CONFIG.pickupMethod = choice end)
-dropdownRow(pageGun, "Select Weapon",
-	{ "Remington 870", "AK-47", "M9", "M4A1" }, CONFIG.gunChoice,
-	function(choice) CONFIG.gunChoice = choice end)
-pairRow(pageGun, "Give Selected Gun", function()
-	if giveAnywhere(CONFIG.gunChoice) then
-		toast("Weapon Granted", CONFIG.gunChoice .. " added to backpack", 2, "ok")
-	end
-end, "Give All Guns + Mod", function()
-	giveAllLoot(true)
-end)
-pairRow(pageGun, "Key Card", function() giveAnywhere("Key card") end,
-	"Hammer + Knife", function() giveAnywhere("Hammer"); giveAnywhere("Crude Knife") end)
-pairRow(pageGun, "Riot Shield + Gear", function() giveRiotGear() end,
-	"Reload Held Gun (Server)", function()
-		local tool = lp.Character and lp.Character:FindFirstChildWhichIsA("Tool")
-		if tool then reloadToolServer(tool); toast("Reloaded", "Server ammo refilled", 1.5, "ok") end
-	end)
-toggleRow(pageGun, "autoRearmOn", "Auto Re-Arm + Mod On Respawn", "Automatically pulls guns & applies One-Shot mods every respawn",
-	CONFIG.autoRearm, function(v) CONFIG.autoRearm = v end)
-toggleRow(pageGun, "autoReloadSrvOn", "Auto Server Reload (ReloadEvent)", "Continuously refills server-side ammo so modded guns never dry-fire",
-	CONFIG.autoReloadServer, function(v) CONFIG.autoReloadServer = v end)
-
-section(pageGun, "One-Click Gun Presets")
-pairRow(pageGun, "1-Shot Laser Preset", function()
-	CONFIG.gunDamage = 105
-	CONFIG.gunBullets = 14
-	CONFIG.gunFireRate = 0.001
-	CONFIG.gunSpread = 0
-	CONFIG.gunInfiniteAmmo = true
-	CONFIG.gunAutoFire = true
-	modAllGuns()
-	toast("Laser Preset", "105 DMG · 0 Spread · Full Auto · 14x Bullets", 2.2, "ok")
-end, "Wall-of-Lead Shotgun", function()
-	CONFIG.gunDamage = 100
-	CONFIG.gunBullets = 28
-	CONFIG.gunFireRate = 0.005
-	CONFIG.gunSpread = 0.025
-	CONFIG.gunInfiniteAmmo = true
-	CONFIG.gunAutoFire = true
-	modAllGuns()
-	toast("Wall of Lead", "28 Pellets per shot applied!", 2.2, "ok")
-end)
-
-section(pageGun, "Custom GunStates Editor")
-sliderRow(pageGun, "Damage", 10, 250, CONFIG.gunDamage, function(v) CONFIG.gunDamage = math.floor(v + 0.5) end)
-sliderRow(pageGun, "Bullets Per Shot", 1, 35, CONFIG.gunBullets, function(v) CONFIG.gunBullets = math.floor(v + 0.5) end)
-sliderRow(pageGun, "Fire Delay (ms)", 0, 100, 1, function(v) CONFIG.gunFireRate = math.max(v / 1000, 0.0001) end, " ms")
-sliderRow(pageGun, "Spread", 0, 100, CONFIG.gunSpread, function(v) CONFIG.gunSpread = v / 1000 end)
-toggleRow(pageGun, "infAmmo", "Infinite Ammo", "CurrentAmmo pinned to math.huge",
-	CONFIG.gunInfiniteAmmo, function(v) CONFIG.gunInfiniteAmmo = v end)
-toggleRow(pageGun, "autoFire", "Full Automatic", "Hold mouse/tap to continuous-fire M9 & Remington",
-	CONFIG.gunAutoFire, function(v) CONFIG.gunAutoFire = v end)
-buttonRow(pageGun, "Apply Custom Mods To All Guns", function() modAllGuns() end, true)
-
--- ============================================================================
--- 5) MOVEMENT & VEHICLES PAGE
--- ============================================================================
-section(pageMov, "Character Locomotion")
-sliderRow(pageMov, "Walk Speed", 16, 250, CONFIG.walkSpeed,
-	function(v) CONFIG.walkSpeed = math.floor(v + 0.5) end)
-sliderRow(pageMov, "Jump Power", 50, 250, CONFIG.jumpPower,
-	function(v) CONFIG.jumpPower = math.floor(v + 0.5) end)
-toggleRow(pageMov, "noclipOn", "Noclip (Phase Through Walls)", "Walk straight through prison doors, cells, and walls",
-	false, function() end)
-toggleRow(pageMov, "infJump", "Infinite Jump", "Jump mid-air infinitely",
-	false, function() end)
-toggleRow(pageMov, "tpWalkOn", "TP-Walk (CFrame Speed Bypass)", "Moves root part via CFrame each frame",
-	false, function() end)
-sliderRow(pageMov, "TP-Walk Power", 1, 15, CONFIG.tpWalkPower,
-	function(v) CONFIG.tpWalkPower = math.floor(v + 0.5) end)
-toggleRow(pageMov, "spinOn", "SpinBot", "Rotates your character rapidly",
-	false, function() end)
-
-section(pageMov, "Flight (Key: Z)")
-toggleRow(pageMov, "flyOn", "Fly (PC: WASD+E/Q · Mobile: On-Screen Pad)", "Smooth CFrame flight with zero fall drift",
-	false, function(v)
-		flyPad.Visible = v or (state.toggles.carFlyOn == true)
-		if not v then state.touchMove = { fwd = 0, back = 0, up = 0, down = 0 } end
-	end)
-sliderRow(pageMov, "Fly Speed", 1, 25, CONFIG.flySpeed,
-	function(v) CONFIG.flySpeed = math.floor(v + 0.5) end)
-toggleRow(pageMov, "clickTpOn", "Click / Tap To Teleport", "Tap any surface in the world to warp there",
-	false, function(v) CONFIG.clickTp = v end)
-
-section(pageMov, "Vehicle Spawner & Car Mods")
-pairRow(pageMov, "Spawn Sedan Here", function() spawnCarHere("Sedan") end,
-	"Spawn Police Squad Here", function() spawnCarHere("Police") end)
-buttonRow(pageMov, "Apply Speed & Torque Boost To Seated Car", function() modCurrentCar() end, true)
-sliderRow(pageMov, "Car Speed Multiplier", 1, 8, CONFIG.carSpeedMult,
-	function(v) CONFIG.carSpeedMult = v end, "x")
-toggleRow(pageMov, "carFlyOn", "Car Fly (Drive In The Sky)", "Fly any vehicle while seated in the driver seat",
-	false, function(v)
-		flyPad.Visible = v or (state.toggles.flyOn == true)
-	end)
-toggleRow(pageMov, "carNoclipOn", "Car Noclip", "Drive vehicles straight through fences & prison walls",
-	false, function() end)
-
--- ============================================================================
--- 6) VISUALS PAGE
--- ============================================================================
-section(pageVis, "Player ESP")
-toggleRow(pageVis, "espOn", "Enable Player ESP", "Shows Name, HP%, Distance, and Equipped Weapon",
-	false, function() refreshEsp() end)
-toggleRow(pageVis, "espNamesOn", "Show Names", "", true, function(v) CONFIG.espNames = v end)
-toggleRow(pageVis, "espDistOn", "Show Distance & Held Weapon", "", true, function(v) CONFIG.espDistance = v end)
-toggleRow(pageVis, "espHpOn", "Show Health %", "", true, function(v) CONFIG.espHealthBar = v end)
-toggleRow(pageVis, "espTeamOn", "Team Color Coding", "Blue = Guard · Orange = Inmate · Red = Criminal",
-	true, function(v) CONFIG.espTeamColor = v end)
-toggleRow(pageVis, "espTracers", "Snapline Tracers", "Draws lines from screen bottom to every player",
-	false, function(v) CONFIG.espTracers = v end)
-
-section(pageVis, "Chams (Wall-Vision Highlights)")
-toggleRow(pageVis, "chamsOn", "Team Chams (Highlights)", "Full-body glowing silhouettes visible through walls",
-	false, function() refreshEsp() end)
-toggleRow(pageVis, "chamsWallOn", "Always On Top (Through Walls)", "Renders highlights through solid walls",
-	CONFIG.chamsThroughWalls, function(v)
-		CONFIG.chamsThroughWalls = v
-		for _, plr in ipairs(plrs:GetPlayers()) do applyChams(plr) end
-	end)
-
-section(pageVis, "World & Camera")
-toggleRow(pageVis, "fullbrightOn", "Fullbright (No Night / Fog)", "Removes darkness, shadows, and fog",
-	false, function(v) setFullbright(v) end)
-toggleRow(pageVis, "fpsBoostOn", "FPS Booster", "Disables particles, smoke, and trails for higher FPS",
-	false, function(v) setFpsBoost(v) end)
-toggleRow(pageVis, "showAimFovShow", "Show Aimbot FOV Ring", "Displays the targeting circle when Aimbot/Silent Aim is on",
-	true, function(v) CONFIG.showAimFov = v end)
-sliderRow(pageVis, "Camera FOV", 50, 120, 70, function(v)
-	pcall(function() currentCam().FieldOfView = math.floor(v + 0.5) end)
-end)
-
--- ============================================================================
--- 7) TELEPORT PAGE
--- ============================================================================
-section(pageTele, "Key Prison Locations")
-for i = 1, #TELEPORTS, 2 do
-	local a = TELEPORTS[i]
-	local b = TELEPORTS[i + 1]
-	if a and b then
-		pairRow(pageTele, a.name, function() teleportTo(a.fn()) end,
-			b.name, function() teleportTo(b.fn()) end)
-	elseif a then
-		buttonRow(pageTele, a.name, function() teleportTo(a.fn()) end)
-	end
+function R.ui.openPanel(open)
+    S.open = open == true
+    if S.open then
+        if S.picker then R.ui.closePicker() end
+        if S.activeTab then R.ui.selectTab(S.activeTab) end
+    else
+        S.aimHeld = false
+    end
+    R.ui.syncOverlay()
 end
 
-section(pageTele, "Dynamic Teleports")
-pairRow(pageTele, "Nearest Player", function()
-	local myRoot = charRoot()
-	if not myRoot then return end
-	local best, bestD = nil, math.huge
-	for _, plr in ipairs(plrs:GetPlayers()) do
-		if plr ~= lp and charRoot(plr) then
-			local d = (charRoot(plr).Position - myRoot.Position).Magnitude
-			if d < bestD then best, bestD = charRoot(plr), d end
-		end
-	end
-	if best then teleportTo(best.CFrame * CFrame.new(0, 0, 2.5)) end
-end, "Nearest Spawned Car", function()
-	local cc = workspace:FindFirstChild("CarContainer")
-	local seat = cc and cc:FindFirstChildWhichIsA("VehicleSeat", true)
-	if seat then
-		teleportTo(seat.CFrame)
-		if charHumanoid() then pcall(function() seat:Sit(charHumanoid()) end) end
-	else
-		toast("No Cars", "Use Spawn Sedan Here in MOVE & CAR tab", 2, "err")
-	end
-end)
+function R.ui.syncOverlay()
+    local open = S.open
+    if S.ui.scrim then S.ui.scrim.Visible = open end
+    if S.ui.panel then S.ui.panel.Visible = open end
+    if S.ui.dock then
+        S.ui.dock.Visible = (not open) and C.quickDock and S.isTouch
+    end
+    if S.ui.orb then
+        S.ui.orb.Visible = (not open) and (not (C.quickDock and S.isTouch))
+    end
+    local flying = S.toggles.flyOn and not open
+    if S.ui.flyUp then S.ui.flyUp.Visible = flying end
+    if S.ui.flyDown then S.ui.flyDown.Visible = flying end
+end
 
-section(pageTele, "Custom Saved Waypoints")
-for slot = 1, 3 do
-	pairRow(pageTele, "Save Waypoint #" .. slot, function()
-		local r = charRoot()
-		if r then
-			CONFIG.waypoints[slot] = r.CFrame
-			toast("Waypoint #" .. slot, "Saved current position!", 1.5, "ok")
-		end
-	end, "Teleport Waypoint #" .. slot, function()
-		local cf = CONFIG.waypoints[slot]
-		if cf then
-			teleportTo(cf)
-		else
-			toast("Empty Slot", "Save Waypoint #" .. slot .. " first", 1.5, "err")
-		end
-	end)
+function R.ui.syncDock()
+    local buttons = S.ui.dockButtons
+    if not buttons then return end
+    local function paint(name, active, accent)
+        local button = buttons[name]
+        if not button then return end
+        button.BackgroundColor3 = active
+            and (accent and THEME.accentDark or THEME.cardUp)
+            or THEME.card
+        button.TextColor3 = active and THEME.accent or THEME.text
+    end
+    paint("aura", S.toggles.auraKillOn == true, true)
+    -- Active means the assist is enabled; accent means the camera is actually
+    -- locking now. Always Lock on Touch keeps the accent lit without a hold.
+    paint("aim", S.toggles.aimOn == true,
+        S.toggles.aimOn == true and (S.aimHeld == true or C.aimAlwaysLock == true))
+    paint("fly", S.toggles.flyOn == true, true)
+end
+
+function R.ui.setStatus(text, kind)
+    if not S.ui.subtitle then return end
+    S.ui.subtitle.Text = "MOBILE v4.0 · " .. tostring(text)
+    if S.ui.statusDot then
+        S.ui.statusDot.BackgroundColor3 = kind == "err" and THEME.danger
+            or (kind == "warn" and THEME.warn or THEME.good)
+    end
+end
+
+function R.ui.composeStatus()
+    local M = R.remotes
+    local count = 0
+    if M.melee then count = count + 1 end
+    if M.shoot then count = count + 1 end
+    if M.item then count = count + 1 end
+    return string.format("%d fps · remotes %d/3 · %s",
+        S.fps or 0, count, S.isTouch and "touch" or "desktop")
+end
+
+function R.ui.syncStatus()
+    R.ui.setStatus(R.ui.composeStatus(), "ok")
+end
+
+function R.ui.finish()
+    local order = S.ui.pageOrder or {}
+    if order[1] then R.ui.selectTab(order[1]) end
+    R.ui.openPanel(true)
+    R.ui.layout()
+    R.ui.syncDock()
+    R.ui.setStatus("ready", "ok")
+    task.delay(0.6, function()
+        if not S.detached then
+            R.toast("Riot Hub Mobile", "Tap ✕ to close. The quick dock stays out of the jump zone.", 4, "ok")
+        end
+    end)
 end
 
 -- ============================================================================
--- 8) WORLD & PROTECTIONS PAGE
+-- LAYOUT
 -- ============================================================================
-section(pageSrv, "Character Protections")
-toggleRow(pageSrv, "antiStunOn", "Anti-Taze / Anti-Stun", "Prevents taser from freezing you or locking your Backpack UI",
-	CONFIG.noStayStunned, function(v) CONFIG.noStayStunned = v end)
-toggleRow(pageSrv, "antiArrestOn", "Anti-Arrest (Auto-Break Cuffs)", "Instantly respawns & returns you to your spot if a Guard cuffs you",
-	CONFIG.antiArrest, function(v) CONFIG.antiArrest = v end)
-toggleRow(pageSrv, "respawnDeathOn", "Respawn Where You Died", "Auto-respawns via loadchar and teleports back to your death spot",
-	CONFIG.respawnAtDeath, function(v)
-		CONFIG.respawnAtDeath = v
-		if v then CONFIG.instantRespawn = true end
-	end)
-toggleRow(pageSrv, "instantRespawnOn", "Instant Respawn (No 5s Wait)", "Immediately spawns a fresh character when you die",
-	CONFIG.instantRespawn, function(v) CONFIG.instantRespawn = v end)
-toggleRow(pageSrv, "antiShieldOn", "Anti-Riot Shield", "Strips Riot Shields from Guards so your bullets never get blocked",
-	CONFIG.antiShield, function(v) CONFIG.antiShield = v end)
-toggleRow(pageSrv, "antiCrimPadOn", "Anti-Criminal Spawn Pad", "Lets Guards walk into Criminal Base without getting team-switched",
-	CONFIG.antiCrimPad, function(v)
-		CONFIG.antiCrimPad = v
-		setAntiCrimPad(v)
-	end)
+function R.ui.layout()
+    local viewport = R.viewport()
+    local vw, vh = viewport.X, viewport.Y
+    local compact = vw < 760 or vh < 500
+    local short = vh < 500
+    local phone = vw < 600
+    S.layout = { vw = vw, vh = vh, compact = compact, short = short, phone = phone }
 
-section(pageSrv, "World & Map Control")
-toggleRow(pageSrv, "doorsRemovedOn", "Remove All Doors & Fences (Reversible)", "Hides all prison doors, cell bars, and fences — toggle OFF to restore!",
-	false, function(v) setDoorsRemoved(v) end)
-buttonRow(pageSrv, "Open Prison Main Gate", function() openGate() end)
-toggleRow(pageSrv, "gateLoopOn", "Loop Open Prison Gate", "Continuously opens the main prison gate on an interval",
-	false, function() end)
-sliderRow(pageSrv, "Gate Loop Interval", 1, 6, CONFIG.gateSpamInterval,
-	function(v) CONFIG.gateSpamInterval = math.max(0.5, v) end, " s")
+    local panel = S.ui.panel
+    if panel then
+        if compact then
+            panel.AnchorPoint = Vector2.new(0, 0)
+            panel.Size = UDim2.new(1, -12, 1, -12)
+            panel.Position = UDim2.new(0, 6, 0, 6)
+        else
+            panel.AnchorPoint = Vector2.new(0.5, 0.5)
+            panel.Size = UDim2.fromOffset(
+                math.min(860, math.max(640, vw - 100)),
+                math.min(640, math.max(480, vh - 80)))
+            panel.Position = UDim2.new(0.5, 0, 0.5, 0)
+        end
+    end
 
-section(pageSrv, "Server Utilities")
-pairRow(pageSrv, "Rebind Remotes", function() rebindRemotes(6) end,
-	"Rejoin Current Server", function()
-		toast("Rejoining", "Reconnecting to Prison Life...", 2)
-		task.wait(0.3)
-		pcall(function() teleportSvc:Teleport(game.PlaceId, lp) end)
-	end)
+    local headerHeight = short and 50 or 54
+    if S.ui.header then S.ui.header.Size = UDim2.new(1, 0, 0, headerHeight) end
+    if S.ui.close then
+        S.ui.close.Size = UDim2.fromOffset(44, 44)
+        S.ui.close.Position = UDim2.new(1, -52, 0, (headerHeight - 44) / 2)
+    end
+    if S.ui.title then
+        S.ui.title.Position = UDim2.fromOffset(16, short and 5 or 7)
+    end
+    if S.ui.subtitle then
+        S.ui.subtitle.Position = UDim2.fromOffset(28, short and 27 or 29)
+    end
+    if S.ui.statusDot then
+        S.ui.statusDot.Position = UDim2.fromOffset(16, short and 31 or 33)
+    end
 
--- ============================================================================
--- 9) SETUP & CONFIG PAGE
--- ============================================================================
-section(pageCfg, "Hotkeys & Chat Commands")
-infoRow(pageCfg, "PC HOTKEYS:\n"
-	.. "RightCtrl / U = Toggle UI · G = Kill Aura · H = Arrest Aura · J = Taze Loop\n"
-	.. "F = Super Punch · Z = Fly · F3 = Open Gate\n\n"
-	.. "CHAT COMMANDS (Type in chat):\n"
-	.. ":kill [name/all] · :loopkill [name] · :unloopkill [name] · :fling [name/all]\n"
-	.. ":arrest [name/all] · :taze [name/all] · :goto [name] · :view [name] · :unview\n"
-	.. ":guns · :mod · :car · :gate · :doors · :nodoors · :re · :crim · :guard · :inmate", 118)
+    local tabHolder = S.ui.tabHolder
+    local pageHost = S.ui.pageHost
+    local tabLayout = S.ui.tabLayout
+    if tabHolder and pageHost and tabLayout then
+        if compact then
+            tabHolder.Position = UDim2.new(0, 8, 0, headerHeight + (short and 4 or 8))
+            tabHolder.Size = UDim2.new(1, -16, 0, short and 48 or 52)
+            tabHolder.ScrollingDirection = Enum.ScrollingDirection.X
+            tabHolder.AutomaticCanvasSize = Enum.AutomaticSize.X
+            tabHolder.CanvasSize = UDim2.new(0, 0, 0, 0)
+            tabLayout.FillDirection = Enum.FillDirection.Horizontal
+            tabLayout.Padding = UDim.new(0, 6)
+            tabLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+            local tabTop = headerHeight + (short and 4 or 8)
+            pageHost.Position = UDim2.new(0, 10, 0, tabTop + (short and 48 or 52) + 6)
+            pageHost.Size = UDim2.new(1, -20, 1,
+                -(tabTop + (short and 48 or 52) + 6) - (short and 4 or 8))
+        else
+            tabHolder.Position = UDim2.new(0, 8, 0, headerHeight + 8)
+            tabHolder.Size = UDim2.new(0, 190, 1, -(headerHeight + 16))
+            tabHolder.ScrollingDirection = Enum.ScrollingDirection.Y
+            tabHolder.AutomaticCanvasSize = Enum.AutomaticSize.Y
+            tabHolder.CanvasSize = UDim2.new(0, 0, 0, 0)
+            tabLayout.FillDirection = Enum.FillDirection.Vertical
+            tabLayout.Padding = UDim.new(0, 6)
+            tabLayout.VerticalAlignment = Enum.VerticalAlignment.Top
+            pageHost.Position = UDim2.new(0, 206, 0, headerHeight + 8)
+            pageHost.Size = UDim2.new(1, -214, 1, -(headerHeight + 16))
+        end
+    end
 
-section(pageCfg, "Configuration Persistence")
-pairRow(pageCfg, "Save Config", function()
-	if writefile then
-		pcall(function() writefile("RiotHub_v4_Config.json", httpSvc:JSONEncode(CONFIG)) end)
-		toast("Config Saved", "Saved to RiotHub_v4_Config.json", 2, "ok")
-	else
-		getGenv().RiotHubConfig = CONFIG
-		toast("Config Cached", "Saved to executor memory", 2, "ok")
-	end
-end, "Load Config", function()
-	local raw
-	if readfile and isfile and isfile("RiotHub_v4_Config.json") then
-		raw = readfile("RiotHub_v4_Config.json")
-	elseif getGenv().RiotHubConfig then
-		raw = httpSvc:JSONEncode(getGenv().RiotHubConfig)
-	end
-	if raw then
-		pcall(function()
-			local loaded = httpSvc:JSONDecode(raw)
-			for k, v in pairs(loaded) do
-				if type(v) ~= "table" then CONFIG[k] = v end
-			end
-		end)
-		toast("Config Loaded", "Settings restored!", 2, "ok")
-	else
-		toast("No Saved Config", "Click Save Config first", 2, "err")
-	end
-end)
+    if S.ui.pages then
+        for _, entry in pairs(S.ui.pages) do
+            entry.page.Size = UDim2.fromScale(1, 1)
+        end
+    end
+    if S.ui.tabs then
+        for _, button in pairs(S.ui.tabs) do
+            if compact then
+                button.Size = UDim2.fromOffset(short and 88 or 96, short and 44 or 46)
+                button.TextSize = short and 11 or 12
+            else
+                button.Size = UDim2.fromOffset(174, 44)
+                button.TextSize = 13
+            end
+        end
+    end
 
-toggleRow(pageCfg, "safePacingOn", "Strict Server Pacing Delay", "Adds delay between ItemHandler pulls (only needed on custom anti-cheat servers)",
-	CONFIG.safePacing, function(v) CONFIG.safePacing = v end)
-toggleRow(pageCfg, "reduceAnimOn", "Reduce UI Animations", "Snappier transitions for low-end mobile devices",
-	CONFIG.reduceAnim, function(v)
-		CONFIG.reduceAnim = v
-		state.uiAnim = v and 0 or 0.14
-	end)
+    local dock = S.ui.dock
+    if dock then
+        local buttonSize = short and 44 or 48
+        dock.Size = short
+            and UDim2.fromOffset(buttonSize * 4 + 3 * 4 + 12, 52)
+            or UDim2.fromOffset(buttonSize + 12, buttonSize * 4 + 3 * 6 + 12)
+        if short then
+            -- 76 px above the bottom keeps the bar out of the thumbstick and
+            -- jump zones that Roblox reserves on landscape phones.
+            dock.AnchorPoint = Vector2.new(0.5, 1)
+            dock.Position = UDim2.new(0.5, 0, 1, -76)
+            S.ui.dockLayout.FillDirection = Enum.FillDirection.Horizontal
+            S.ui.dockLayout.Padding = UDim.new(0, 4)
+        else
+            dock.AnchorPoint = Vector2.new(1, 0.5)
+            dock.Position = UDim2.new(1, -8, 0.5, 0)
+            S.ui.dockLayout.FillDirection = Enum.FillDirection.Vertical
+            S.ui.dockLayout.Padding = UDim.new(0, 6)
+        end
+        for _, button in pairs(S.ui.dockButtons or {}) do
+            button.Size = UDim2.fromOffset(buttonSize, buttonSize)
+            button.TextSize = 11
+        end
+    end
 
-section(pageCfg, "Session Control")
-pairRow(pageCfg, "Hide Hub Window", function() window.Visible = false end,
-	"Unload RiotHub Completely", function()
-		if getGenv().RiotHub and getGenv().RiotHub.Unload then
-			getGenv().RiotHub.Unload()
-		end
-	end)
-
--- ============================================================================
--- BACKGROUND MANAGERS (AURAS, LOOPKILL, AUTO-RELOAD, STATS)
--- ============================================================================
--- 1. Combat Aura + Loopkill Loop
-task.spawn(function()
-	while not state.detached do
-		task.wait(math.max(CONFIG.killAuraRate, 0.12))
-		local myRoot = charRoot()
-		if myRoot and not state.flinging then
-			-- Kill Aura
-			if state.toggles.auraKillOn then
-				for _, plr in ipairs(plrs:GetPlayers()) do
-					if plr ~= lp and selTarget(plr, "auraTargets") then
-						local ch = plr.Character
-						local hum = charHumanoid(plr)
-						local theirRoot = charRoot(plr)
-						if ch and hum and hum.Health > 0 and theirRoot then
-							local d = (theirRoot.Position - myRoot.Position).Magnitude
-							if d <= CONFIG.killAuraRadius then
-								local ff = ch:FindFirstChildOfClass("ForceField")
-								if not (ff and CONFIG.killAuraIgnoreFF) then
-									killTarget(plr)
-								end
-							end
-						end
-					end
-				end
-			end
-
-			-- Persistent Loopkill Targets
-			for targetName, active in pairs(state.loopKillTargets) do
-				if active then
-					local t = plrs:FindFirstChild(targetName)
-					local hum = t and charHumanoid(t)
-					local ff = t and t.Character and t.Character:FindFirstChildOfClass("ForceField")
-					if t and hum and hum.Health > 0 and not ff then
-						killTarget(t)
-					end
-				end
-			end
-
-			-- Arrest Aura
-			if state.toggles.auraArrestOn then
-				for _, plr in ipairs(arrestables()) do
-					local theirRoot = charRoot(plr)
-					if theirRoot and (theirRoot.Position - myRoot.Position).Magnitude <= CONFIG.arrestAuraRadius then
-						if arrestTarget(plr) then
-							state.arrestCount = state.arrestCount + 1
-						end
-						task.wait(CONFIG.arrestAuraRate)
-						break
-					end
-				end
-			end
-		end
-	end
-end)
-
--- 2. Taze Aura & Loop-Taze Loop
-task.spawn(function()
-	while not state.detached do
-		task.wait(0.45)
-		local taser = getTaser()
-		if taser then
-			if state.toggles.auraTazeOn then
-				for _, plr in ipairs(plrs:GetPlayers()) do
-					if plr ~= lp and not isGuard(plr) and charHumanoid(plr) and charHumanoid(plr).Health > 0 then
-						tazeTarget(plr, taser)
-						task.wait(0.08)
-					end
-				end
-			end
-			for targetName, active in pairs(state.loopTazeTargets) do
-				if active then
-					local t = plrs:FindFirstChild(targetName)
-					if t and charHumanoid(t) and charHumanoid(t).Health > 0 then
-						tazeTarget(t, taser)
-					end
-				end
-			end
-		end
-	end
-end)
-
--- 3. Auto Server Reload Loop (keeps server-side gun magazine full at all times)
-task.spawn(function()
-	while not state.detached do
-		task.wait(0.8)
-		if CONFIG.autoReloadServer and lp.Character then
-			local tool = lp.Character:FindFirstChildWhichIsA("Tool")
-			if tool and tool:FindFirstChild("GunStates") then
-				reloadToolServer(tool)
-			end
-		end
-	end
-end)
-
--- 4. Gate Spam & Chams Refresh
-task.spawn(function()
-	while not state.detached do
-		task.wait(CONFIG.gateSpamInterval)
-		if state.toggles.gateLoopOn then openGate() end
-	end
-end)
-
-task.spawn(function()
-	while not state.detached do
-		task.wait(2)
-		if state.toggles.chamsOn then
-			for _, plr in ipairs(plrs:GetPlayers()) do
-				if plr ~= lp then applyChams(plr) end
-			end
-		end
-	end
-end)
-
--- 5. FPS + Status Bar Ticker
-local frameCount = 0
-connect(runSvc.Heartbeat, function() frameCount = frameCount + 1 end)
-task.spawn(function()
-	while not state.detached do
-		task.wait(1)
-		state.fps = frameCount
-		frameCount = 0
-		pcall(function()
-			statusLabel.Text = "v4.0 · " .. tostring(state.fps) .. " fps · "
-				.. tostring(#plrs:GetPlayers()) .. " plrs · remotes: M"
-				.. (meleeEvent and "+" or "-") .. " S"
-				.. (shootingEvent and "+" or "-") .. " R"
-				.. (reloadEvent and "+" or "-") .. " I"
-				.. (ItemHandler and "+" or "-")
-			statKills.Text = tostring(state.killCounter) .. " kills/hits"
-			statArrests.Text = tostring(state.arrestCount) .. " cuffs"
-			statItems.Text = tostring(state.itemCount) .. " items"
-		end)
-	end
-end)
-
--- ============================================================================
--- INPUTS, HOTKEYS & CHAT COMMAND ENGINE
--- ============================================================================
--- Screen Tap Gestures (Click-TP & Click-Arrest)
-connect(uis.InputBegan, function(input, processed)
-	if state.detached or processed then return end
-	if not (input.UserInputType == Enum.UserInputType.Touch
-		or input.UserInputType == Enum.UserInputType.MouseButton1) then
-		return
-	end
-	local camera = currentCam()
-	if not camera then return end
-	local pos = input.Position
-	if state.toggles.clickTpOn then
-		pcall(function()
-			local ray = camera:ViewportPointToRay(pos.X, pos.Y)
-			local hit = workspace:Raycast(ray.Origin, ray.Direction * 5000)
-			if hit and hit.Position then
-				teleportTo(CFrame.new(hit.Position))
-			end
-		end)
-	end
-	if state.toggles.clickArrestOn then
-		pcall(function()
-			local ray = camera:ViewportPointToRay(pos.X, pos.Y)
-			local hit = workspace:Raycast(ray.Origin, ray.Direction * 5000)
-			if hit and hit.Instance then
-				local ch = hit.Instance:FindFirstAncestorOfClass("Model")
-				local plr = ch and plrs:GetPlayerFromCharacter(ch)
-				if plr and plr ~= lp and not isGuard(plr) then
-					arrestTarget(plr)
-				end
-			end
-		end)
-	end
-end)
-
--- Keyboard Shortcuts
-connect(uis.InputBegan, function(input, processed)
-	if state.detached or processed then return end
-	local kc = input.KeyCode
-	if kc == Enum.KeyCode.RightControl or kc == Enum.KeyCode.U then
-		window.Visible = not window.Visible
-		if window.Visible then popWindow() end
-	elseif kc == Enum.KeyCode.G then
-		local sw = state.switches.auraKillOn
-		if sw then sw.Set(not state.toggles.auraKillOn) end
-	elseif kc == Enum.KeyCode.H then
-		local sw = state.switches.auraArrestOn
-		if sw then sw.Set(not state.toggles.auraArrestOn) end
-	elseif kc == Enum.KeyCode.J then
-		local sw = state.switches.auraTazeOn
-		if sw then sw.Set(not state.toggles.auraTazeOn) end
-	elseif kc == Enum.KeyCode.Z then
-		local sw = state.switches.flyOn
-		if sw then sw.Set(not state.toggles.flyOn) end
-	elseif kc == Enum.KeyCode.F then
-		if CONFIG.superPunch then triggerSuperPunch() end
-	elseif kc == Enum.KeyCode.F3 then
-		openGate()
-	end
-end)
-
--- PrizzLife / Tiger Admin Style Chat Commands (:kill, :fling, :car, :re, etc.)
-connect(lp.Chatted, function(msg)
-	if state.detached or not CONFIG.chatCmds then return end
-	if string.sub(msg, 1, 1) ~= ":" and string.sub(msg, 1, 1) ~= ";" then return end
-	local parts = string.split(string.sub(msg, 2), " ")
-	local cmd = string.lower(parts[1] or "")
-	local arg = parts[2] or ""
-
-	if cmd == "kill" then
-		if string.lower(arg) == "all" or arg == "" then
-			killAll(CONFIG.killAuraMode)
-		else
-			local t = findPlayerByQuery(arg)
-			if t then killTarget(t) end
-		end
-	elseif cmd == "loopkill" or cmd == "lk" then
-		local t = findPlayerByQuery(arg)
-		if t then
-			state.loopKillTargets[t.Name] = true
-			toast("Loopkill", "Locked onto " .. t.Name, 2, "ok")
-		end
-	elseif cmd == "unloopkill" or cmd == "unlk" then
-		if string.lower(arg) == "all" or arg == "" then
-			state.loopKillTargets = {}
-		else
-			local t = findPlayerByQuery(arg)
-			if t then state.loopKillTargets[t.Name] = nil end
-		end
-		toast("Loopkill", "Stopped loopkill", 1.8, "ok")
-	elseif cmd == "fling" then
-		if string.lower(arg) == "all" then
-			flingAll()
-		else
-			local t = findPlayerByQuery(arg) or getActiveTarget()
-			if t then flingTarget(t, 1.8) end
-		end
-	elseif cmd == "arrest" then
-		if string.lower(arg) == "all" or arg == "" then
-			arrestAll()
-		else
-			local t = findPlayerByQuery(arg)
-			if t then arrestTarget(t) end
-		end
-	elseif cmd == "taze" then
-		if string.lower(arg) == "all" or arg == "" then
-			tazeAll()
-		else
-			local t = findPlayerByQuery(arg)
-			if t then tazeTarget(t) end
-		end
-	elseif cmd == "goto" or cmd == "to" then
-		local t = findPlayerByQuery(arg)
-		if t and charRoot(t) then
-			teleportTo(charRoot(t).CFrame * CFrame.new(0, 0, 2.5))
-		end
-	elseif cmd == "view" or cmd == "spectate" then
-		local t = findPlayerByQuery(arg)
-		if t and charHumanoid(t) and currentCam() then
-			currentCam().CameraSubject = charHumanoid(t)
-		end
-	elseif cmd == "unview" or cmd == "unspectate" then
-		if charHumanoid() and currentCam() then
-			currentCam().CameraSubject = charHumanoid()
-		end
-	elseif cmd == "guns" or cmd == "allguns" then
-		giveAllLoot(true)
-	elseif cmd == "mod" or cmd == "modguns" then
-		modAllGuns()
-	elseif cmd == "car" or cmd == "v" then
-		spawnCarHere("Sedan")
-	elseif cmd == "gate" then
-		openGate()
-	elseif cmd == "nodoors" or cmd == "doors" then
-		setDoorsRemoved(cmd == "nodoors")
-	elseif cmd == "re" or cmd == "refresh" then
-		refreshCharacterInPlace()
-	elseif cmd == "crim" or cmd == "criminal" then
-		switchTeam("Criminal")
-	elseif cmd == "guard" or cmd == "cop" then
-		switchTeam("Guard")
-	elseif cmd == "inmate" or cmd == "prisoner" then
-		switchTeam("Inmate")
-	elseif cmd == "neutral" then
-		switchTeam("Neutral")
-	end
-end)
-
--- Anti-AFK
-connect(lp.Idled, function()
-	if not CONFIG.antiAfk then return end
-	pcall(function()
-		virtualUser:CaptureController()
-		virtualUser:ClickButton2(Vector2.new())
-	end)
-end)
-
--- Death & Respawn Handler (Instant Respawn + Respawn Where You Died + Auto-Rearm)
-local function hookCharacter(ch)
-	if not ch then return end
-	local hum = ch:WaitForChild("Humanoid", 6)
-	if not hum then return end
-	connect(hum.Died, function()
-		if state.detached then return end
-		local r = ch:FindFirstChild("HumanoidRootPart") or ch:FindFirstChild("Torso")
-		if r then state.lastDeathCF = r.CFrame end
-		if CONFIG.instantRespawn or CONFIG.respawnAtDeath then
-			task.wait(0.35)
-			local loadChar = getRemote("loadchar")
-			if loadChar then
-				vsafe(function() loadChar:InvokeServer(lp.Name) end)
-			end
-		end
-	end)
+    if S.ui.orb then
+        S.ui.orb.Position = UDim2.new(1, -16, 0.38, 0)
+        S.ui.orb.AnchorPoint = Vector2.new(1, 0.5)
+        S.ui.orb.Size = UDim2.fromOffset(54, 54)
+    end
+    if S.ui.flyUp and S.ui.flyDown then
+        if short then
+            S.ui.flyUp.Position = UDim2.new(1, -8, 0.5, -118)
+            S.ui.flyDown.Position = UDim2.new(1, -8, 0.5, -64)
+        else
+            S.ui.flyUp.Position = UDim2.new(1, -8, 0.5, 140)
+            S.ui.flyDown.Position = UDim2.new(1, -8, 0.5, 196)
+        end
+        S.ui.flyUp.AnchorPoint = Vector2.new(1, 0.5)
+        S.ui.flyDown.AnchorPoint = Vector2.new(1, 0.5)
+    end
+    if S.ui.toastHolder then
+        S.ui.toastHolder.Size = UDim2.fromOffset(math.min(vw - 32, 380), 0)
+        S.ui.toastHolder.Position = UDim2.new(0.5, 0, 0, 8)
+        S.ui.toastHolder.AnchorPoint = Vector2.new(0.5, 0)
+    end
+    R.ui.layoutPicker()
 end
 
-if lp.Character then task.spawn(hookCharacter, lp.Character) end
+function R.ui.layoutPicker()
+    local picker = S.ui.picker
+    if not picker then return end
+    local viewport = R.viewport()
+    local compact = viewport.X < 760 or viewport.Y < 500
+    local count = S.pickerCount or 4
+    local height = math.min(count * 58 + 82, viewport.Y * 0.72)
+    if compact then
+        picker.AnchorPoint = Vector2.new(0.5, 1)
+        picker.Size = UDim2.fromOffset(math.min(viewport.X - 16, 520), height)
+        picker.Position = UDim2.new(0.5, 0, 1, -8)
+    else
+        picker.AnchorPoint = Vector2.new(0.5, 0.5)
+        picker.Size = UDim2.fromOffset(430, height)
+        picker.Position = UDim2.new(0.5, 0, 0.5, 0)
+    end
+    if S.ui.pickerScroll then
+        S.ui.pickerScroll.Position = UDim2.fromOffset(8, 52)
+        S.ui.pickerScroll.Size = UDim2.new(1, -16, 1, -60)
+    end
+end
 
-connect(lp.CharacterAdded, function(ch)
-	task.spawn(hookCharacter, ch)
-	local newRoot = ch:WaitForChild("HumanoidRootPart", 6)
-	task.wait(0.15)
-	if CONFIG.respawnAtDeath and state.lastDeathCF and newRoot then
-		pcall(function() newRoot.CFrame = state.lastDeathCF end)
-	end
-	if CONFIG.autoRearm then
-		giveAllLoot(true)
-	end
-	if state.toggles.chamsOn then
-		task.delay(0.5, function()
-			for _, plr in ipairs(plrs:GetPlayers()) do
-				if plr ~= lp then applyChams(plr) end
-			end
-		end)
-	end
-end)
+function R.ui.openPicker(title, options, current, callback)
+    if not S.ui.picker then return end
+    local scroll = S.ui.pickerScroll
+    for _, child in ipairs(scroll:GetChildren()) do
+        if child:IsA("TextButton") then child:Destroy() end
+    end
+    S.pickerCount = #options
+    S.picker = { callback = callback }
+    S.ui.pickerTitle.Text = tostring(title)
+    for index, option in ipairs(options) do
+        local selected = option == current
+        local choice = option
+        local button = make("TextButton", {
+            Name = "Option_" .. slug(option), Text = (selected and "✓  " or "    ") .. option,
+            Size = UDim2.new(1, 0, 0, 52), BackgroundColor3 = selected and THEME.accentDark or THEME.card,
+            Font = Enum.Font.GothamBold, TextSize = 13,
+            TextColor3 = selected and THEME.accent or THEME.text,
+            TextXAlignment = Enum.TextXAlignment.Left, AutoButtonColor = false,
+            BorderSizePixel = 0, LayoutOrder = index, ZIndex = 203,
+        }, scroll)
+        pad(button, 14, 8, 0, 0)
+        corner(button, 10)
+        button.MouseButton1Click:Connect(function()
+            press(button)
+            R.ui.closePicker()
+            if callback then
+                task.spawn(function()
+                    local ok, err = pcall(callback, choice)
+                    if not ok then R.log("picker callback failed: " .. tostring(err), true) end
+                end)
+            end
+        end)
+    end
+    S.ui.pickerScrim.Visible = true
+    S.ui.picker.Visible = true
+    R.ui.layoutPicker()
+end
 
-connect(plrs.PlayerAdded, function(plr)
-	refreshTargetDropdown()
-	if not state.toggles.espOn then return end
-	task.wait(1)
-	if not state.detached and state.toggles.espOn and not state.espUnits[plr] then
-		state.espUnits[plr] = buildEspUnit(plr)
-	end
-end)
-
-connect(plrs.PlayerRemoving, function(plr)
-	destroyEspUnit(plr)
-	destroyTracer(plr)
-	task.defer(refreshTargetDropdown)
-end)
+function R.ui.closePicker()
+    S.picker = nil
+    if S.ui.pickerScrim then S.ui.pickerScrim.Visible = false end
+    if S.ui.picker then S.ui.picker.Visible = false end
+end
 
 -- ============================================================================
--- BOOT & GLOBAL EXPORT
+-- COMPONENTS
 -- ============================================================================
-buildFovRing()
-setupAimbot()
-setupTriggerBot()
-setupSilentAim()
-setupEspFrame()
-refreshTargetDropdown()
+function R.ui.section(page, text)
+    local wrap = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 28), BackgroundTransparency = 1,
+    }, page)
+    make("TextLabel", {
+        Text = string.upper(tostring(text)), Size = UDim2.new(1, 0, 1, -2),
+        BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 11,
+        TextColor3 = THEME.accent, TextXAlignment = Enum.TextXAlignment.Left,
+    }, wrap)
+    make("Frame", {
+        Size = UDim2.new(1, 0, 0, 1), Position = UDim2.new(0, 0, 1, -1),
+        BackgroundColor3 = THEME.stroke, BackgroundTransparency = 0.55,
+        BorderSizePixel = 0,
+    }, wrap)
+    return wrap
+end
 
-getGenv().RiotHub = {
-	Unload = function()
-		state.detached = true
-		pcall(function() setDoorsRemoved(false) end)
-		pcall(function() setAntiCrimPad(false) end)
-		pcall(function() setFullbright(false) end)
-		for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
-		for key, _ in pairs(state.tracers) do destroyTracer(key) end
-		for _, plr in ipairs(plrs:GetPlayers()) do clearChams(plr) end
-		for part, orig in pairs(state.hitboxSaved) do
-			if part and part.Parent then
-				pcall(function()
-					part.Size = orig.Size
-					part.Transparency = orig.Transparency
-					part.CanCollide = orig.CanCollide
-				end)
-			end
-		end
-		pcall(function() screenGui:Destroy() end)
-		pcall(function() if fovRing then fovRing:Destroy() end end)
-		pcall(function() if espContainer then espContainer:Destroy() end end)
-		if getgenv then getgenv().RiotHub = nil else _G.RiotHub = nil end
-	end,
-	log     = log,
-	toast   = toast,
-	config  = CONFIG,
-	toggles = state.toggles,
-}
+function R.ui.info(page, text, height)
+    local body = tostring(text)
+    -- Keep documentation readable instead of clipping it to a guessed height.
+    -- The estimate is deliberately conservative for a 320 px phone.
+    local vw = R.viewport().X
+    local contentWidth = (vw < 760 and (vw - 44)) or 620
+    local charsPerLine = math.max(30, math.floor(contentWidth / 6.4))
+    local lines = math.max(1, math.ceil(#body / charsPerLine))
+    local computed = 30 + lines * 15
+    local boxHeight = math.clamp(math.max(height or 0, computed), 52, 190)
+    local wrap = make("Frame", {
+        Size = UDim2.new(1, 0, 0, boxHeight), BackgroundColor3 = THEME.card,
+        BackgroundTransparency = 0.15, BorderSizePixel = 0,
+    }, page)
+    corner(wrap, 10)
+    make("Frame", {
+        Size = UDim2.new(0, 3, 1, -16), Position = UDim2.new(0, 0, 0, 8),
+        BackgroundColor3 = THEME.violet, BorderSizePixel = 0,
+    }, wrap)
+    make("TextLabel", {
+        Size = UDim2.new(1, -24, 1, -12), Position = UDim2.fromOffset(12, 6),
+        BackgroundTransparency = 1, Text = body, Font = Enum.Font.Gotham,
+        TextSize = 11, TextColor3 = THEME.dim, TextWrapped = true,
+        TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+    }, wrap)
+    return wrap
+end
 
-log("RiotHub v4.0 armed for " .. lp.Name)
-notify("RiotHub v4.0", "Loaded! Tap RH or press RightCtrl", 4)
-toast("RiotHub v4.0 Ready", "Latest Prison Life Bypass + Admin Commands Active", 3.2, "ok")
+function R.ui.button(owner, label, callback, options)
+    options = options or {}
+    local variant = options.variant
+    local background = variant == "danger" and THEME.dangerDark
+        or (variant == "accent" and THEME.accentDark or THEME.card)
+    local button = make("TextButton", {
+        Name = options.name or ("Button_" .. slug(label)),
+        Text = tostring(label), Size = UDim2.new(1, 0, 0, options.height or 50),
+        BackgroundColor3 = background, Font = Enum.Font.GothamBold,
+        TextSize = options.textSize or 13, TextColor3 = variant == "danger" and THEME.danger or THEME.text,
+        AutoButtonColor = false, BorderSizePixel = 0, TextWrapped = true,
+    }, owner)
+    corner(button, 10)
+    if variant == "accent" then stroke(button, THEME.accent, 1, 0.5) end
+    button.MouseButton1Click:Connect(function()
+        press(button)
+        task.spawn(function()
+            local ok, err = pcall(callback)
+            if not ok then R.log("button error [" .. tostring(label) .. "]: " .. tostring(err), true) end
+        end)
+    end)
+    return button
+end
+
+function R.ui.pair(owner, labelA, callbackA, labelB, callbackB)
+    local row = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 50), BackgroundTransparency = 1,
+    }, owner)
+    local function half(label, callback, position)
+        local button = make("TextButton", {
+            Name = "Button_" .. slug(label), Text = tostring(label),
+            Size = UDim2.new(0.5, -4, 1, 0), Position = position,
+            BackgroundColor3 = THEME.card, Font = Enum.Font.GothamBold,
+            TextSize = 12, TextColor3 = THEME.text, AutoButtonColor = false,
+            BorderSizePixel = 0, TextWrapped = true,
+        }, row)
+        corner(button, 10)
+        button.MouseButton1Click:Connect(function()
+            press(button)
+            task.spawn(function()
+                local ok, err = pcall(callback)
+                if not ok then R.log("button error [" .. tostring(label) .. "]: " .. tostring(err), true) end
+            end)
+        end)
+        return button
+    end
+    half(labelA, callbackA, UDim2.fromOffset(0, 0))
+    half(labelB, callbackB, UDim2.new(0.5, 4, 0, 0))
+    return row
+end
+
+function R.ui.toggle(owner, id, titleText, description, default, callback)
+    local hasDescription = description ~= nil and description ~= ""
+    local row = make("TextButton", {
+        Name = "Toggle_" .. id, Text = "", AutoButtonColor = false,
+        Size = UDim2.new(1, 0, 0, hasDescription and 64 or 54),
+        BackgroundColor3 = THEME.card, BorderSizePixel = 0,
+    }, owner)
+    corner(row, 10)
+    local rowStroke = stroke(row, THEME.accent, 1, 0.9)
+    local accentBar = make("Frame", {
+        Size = UDim2.new(0, 3, 1, -18), Position = UDim2.new(0, 0, 0, 9),
+        BackgroundColor3 = THEME.accent, BackgroundTransparency = 0.9,
+        BorderSizePixel = 0,
+    }, row)
+    make("TextLabel", {
+        Name = "Title", Text = tostring(titleText),
+        Size = UDim2.new(1, -84, 0, 18), Position = UDim2.fromOffset(14, hasDescription and 8 or 9),
+        BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 13,
+        TextColor3 = THEME.text, TextXAlignment = Enum.TextXAlignment.Left,
+    }, row)
+    if hasDescription then
+        make("TextLabel", {
+            Name = "Description", Text = tostring(description),
+            Size = UDim2.new(1, -84, 0, 32), Position = UDim2.fromOffset(14, 27),
+            BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11,
+            TextColor3 = THEME.dim, TextXAlignment = Enum.TextXAlignment.Left,
+            TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true,
+        }, row)
+    end
+    local switch = make("Frame", {
+        Name = "Switch", Size = UDim2.fromOffset(46, 28),
+        Position = UDim2.new(1, -60, 0.5, -14),
+        BackgroundColor3 = THEME.track, BorderSizePixel = 0,
+    }, row)
+    corner(switch, 14)
+    local knob = make("Frame", {
+        Name = "Knob", Size = UDim2.fromOffset(22, 22),
+        Position = UDim2.fromOffset(3, 3), BackgroundColor3 = THEME.text,
+        BorderSizePixel = 0,
+    }, switch)
+    corner(knob, 11)
+
+    local enabled = default == true
+    local function paint()
+        switch.BackgroundColor3 = enabled and THEME.good or THEME.track
+        knob.Position = enabled and UDim2.fromOffset(21, 3) or UDim2.fromOffset(3, 3)
+        rowStroke.Transparency = enabled and 0.35 or 0.9
+        accentBar.BackgroundTransparency = enabled and 0 or 0.9
+        row.BackgroundColor3 = enabled and THEME.cardUp or THEME.card
+    end
+    local function set(value, silent)
+        enabled = value == true
+        S.toggles[id] = enabled
+        paint()
+        if R.ui.syncDock then R.ui.syncDock() end
+        if not silent and callback then
+            task.spawn(function()
+                local ok, err = pcall(callback, enabled)
+                if not ok then R.log("toggle error [" .. id .. "]: " .. tostring(err), true) end
+            end)
+        end
+    end
+    row.MouseButton1Click:Connect(function()
+        press(row)
+        set(not enabled)
+    end)
+    S.toggles[id] = enabled
+    S.switches[id] = { Set = set, Get = function() return enabled end }
+    paint()
+    return { Set = set, Get = function() return enabled end, Row = row, Switch = switch }
+end
+
+function R.ui.slider(owner, id, titleText, minValue, maxValue, defaultValue, callback, suffix, step)
+    local row = make("Frame", {
+        Name = "Slider_" .. id, Size = UDim2.new(1, 0, 0, 74),
+        BackgroundColor3 = THEME.card, BorderSizePixel = 0,
+    }, owner)
+    corner(row, 10)
+    make("TextLabel", {
+        Name = "Title", Text = tostring(titleText), Size = UDim2.new(1, -110, 0, 18),
+        Position = UDim2.fromOffset(14, 8), BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = THEME.text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, row)
+    local valueLabel = make("TextLabel", {
+        Name = "Value", Text = "", Size = UDim2.new(0, 92, 0, 18),
+        Position = UDim2.new(1, -104, 0, 8), BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = THEME.accent,
+        TextXAlignment = Enum.TextXAlignment.Right,
+    }, row)
+    local hit = make("Frame", {
+        Name = "TrackHit", Size = UDim2.new(1, -28, 0, 44),
+        Position = UDim2.fromOffset(14, 26), BackgroundTransparency = 1,
+        Active = true,
+    }, row)
+    local track = make("Frame", {
+        Name = "Track", Size = UDim2.new(1, 0, 0, 6),
+        Position = UDim2.new(0, 0, 0.5, -3),
+        BackgroundColor3 = THEME.track, BorderSizePixel = 0,
+    }, hit)
+    corner(track, 3)
+    local fill = make("Frame", {
+        Name = "Fill", Size = UDim2.new(0, 0, 1, 0),
+        BackgroundColor3 = THEME.accent, BorderSizePixel = 0,
+    }, track)
+    corner(fill, 3)
+    local thumb = make("Frame", {
+        Name = "Thumb", Size = UDim2.fromOffset(22, 22),
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0.5, 0),
+        BackgroundColor3 = THEME.text, BorderSizePixel = 0,
+    }, hit)
+    corner(thumb, 11)
+    stroke(thumb, THEME.accent, 2, 0.1)
+
+    local value = defaultValue
+    local function formatValue()
+        if step and step < 1 then
+            return string.format("%.2f", value) .. (suffix or "")
+        end
+        return string.format("%.0f", value) .. (suffix or "")
+    end
+    local function paint(ratio)
+        fill.Size = UDim2.new(ratio, 0, 1, 0)
+        thumb.Position = UDim2.new(ratio, 0, 0.5, 0)
+        valueLabel.Text = formatValue()
+    end
+    local function set(newValue, silent)
+        value = math.clamp(tonumber(newValue) or minValue, minValue, maxValue)
+        local ratio = (value - minValue) / math.max(maxValue - minValue, 0.0001)
+        paint(ratio)
+        if not silent and callback then
+            local ok, err = pcall(callback, value)
+            if not ok then R.log("slider error [" .. id .. "]: " .. tostring(err), true) end
+        end
+    end
+    local function applyAt(x)
+        local absPosition = hit.AbsolutePosition
+        local absSize = hit.AbsoluteSize
+        local width = math.max(absSize and absSize.X or 0, 1)
+        local ratio = math.clamp(((x or 0) - (absPosition and absPosition.X or 0)) / width, 0, 1)
+        local raw = minValue + (maxValue - minValue) * ratio
+        if step and step > 0 then raw = math.floor(raw / step + 0.5) * step end
+        value = math.clamp(raw, minValue, maxValue)
+        paint((value - minValue) / math.max(maxValue - minValue, 0.0001))
+        if callback then
+            local ok, err = pcall(callback, value)
+            if not ok then R.log("slider error [" .. id .. "]: " .. tostring(err), true) end
+        end
+    end
+
+    hit.InputBegan:Connect(function(input)
+        if not isPrimaryInput(input) then return end
+        applyAt(input.Position.X)
+        R.ui.beginDrag(input, function(changed)
+            applyAt(changed.Position.X)
+        end)
+    end)
+    set(defaultValue, true)
+    S.sliders[id] = { Set = set, Get = function() return value end, Row = row }
+    return { Set = set, Get = function() return value end, Row = row }
+end
+
+function R.ui.dropdown(owner, id, titleText, options, defaultValue, callback)
+    local row = make("TextButton", {
+        Name = "Dropdown_" .. id, Text = "", AutoButtonColor = false,
+        Size = UDim2.new(1, 0, 0, 58), BackgroundColor3 = THEME.card,
+        BorderSizePixel = 0,
+    }, owner)
+    corner(row, 10)
+    make("TextLabel", {
+        Text = tostring(titleText), Size = UDim2.new(0.55, -14, 1, 0),
+        Position = UDim2.fromOffset(14, 0), BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = THEME.text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, row)
+    local chosen = make("TextLabel", {
+        Name = "Value", Text = tostring(defaultValue or "-"),
+        Size = UDim2.new(0.45, -34, 1, 0), Position = UDim2.new(0.55, 0, 0, 0),
+        BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 12,
+        TextColor3 = THEME.accent, TextXAlignment = Enum.TextXAlignment.Right,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, row)
+    make("TextLabel", {
+        Text = "›", Size = UDim2.fromOffset(20, 20),
+        Position = UDim2.new(1, -24, 0.5, -10), BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold, TextSize = 18, TextColor3 = THEME.dim,
+    }, row)
+    local current = defaultValue
+    local function set(option)
+        current = option
+        chosen.Text = tostring(option or "-")
+        if callback then
+            local ok, err = pcall(callback, option)
+            if not ok then R.log("dropdown error [" .. id .. "]: " .. tostring(err), true) end
+        end
+    end
+    row.MouseButton1Click:Connect(function()
+        press(row)
+        R.ui.openPicker(titleText, options, current, set)
+    end)
+    S.dropdowns[id] = { Set = set, Get = function() return current end, Row = row }
+    return { Set = set, Get = function() return current end, Row = row }
+end
+
+function R.ui.statStrip(owner, items)
+    local row = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 64), BackgroundTransparency = 1,
+    }, owner)
+    local count = #items
+    local gap = 6
+    -- Card width is W/count - gap. With a half-gap edge margin and one gap
+    -- between cards, positions are (i-1)*W/count + gap/2. Spacing must be
+    -- based on W/count, not on W/count + gap, or the last card is clipped by
+    -- (count-1)*gap pixels on narrow phones.
+    for index, item in ipairs(items) do
+        local card = make("Frame", {
+            Size = UDim2.new(1 / count, -gap, 1, 0),
+            Position = UDim2.new((index - 1) / count, gap / 2, 0, 0),
+            BackgroundColor3 = THEME.card, BorderSizePixel = 0,
+        }, row)
+        corner(card, 10)
+        local value = make("TextLabel", {
+            Name = "StatValue", Text = tostring(item.value or "0"),
+            Size = UDim2.new(1, -12, 0, 24), Position = UDim2.fromOffset(8, 7),
+            BackgroundTransparency = 1, Font = Enum.Font.GothamBold,
+            TextSize = 17, TextColor3 = item.color or THEME.accent,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, card)
+        make("TextLabel", {
+            Text = string.upper(tostring(item.label or "")),
+            Size = UDim2.new(1, -12, 0, 14), Position = UDim2.fromOffset(8, 36),
+            BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11,
+            TextColor3 = THEME.dim, TextXAlignment = Enum.TextXAlignment.Left,
+        }, card)
+        if item.key then S.ui.statLabels = S.ui.statLabels or {}; S.ui.statLabels[item.key] = value end
+    end
+    return row
+end
+
+function R.ui.playerList(owner)
+    local box = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 0), BackgroundTransparency = 1,
+        AutomaticSize = Enum.AutomaticSize.Y,
+    }, owner)
+    make("UIListLayout", {
+        Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder,
+    }, box)
+    local empty = make("TextLabel", {
+        Name = "NearbyEmpty", Text = "No living players match the current filter.",
+        Size = UDim2.new(1, 0, 0, 54), BackgroundColor3 = THEME.card,
+        BackgroundTransparency = 0.25, Font = Enum.Font.Gotham, TextSize = 11,
+        TextColor3 = THEME.dim, TextWrapped = true, Visible = false,
+    }, box)
+    corner(empty, 10)
+    S.ui.nearbyRows = {}
+    for index = 1, 3 do
+        local row = make("Frame", {
+            Name = "NearbyRow" .. index, Size = UDim2.new(1, 0, 0, 56),
+            BackgroundColor3 = THEME.card, BorderSizePixel = 0,
+        }, box)
+        corner(row, 10)
+        -- The TP button starts at W-146. Stop the text at W-164 so a long
+        -- display name cannot run underneath the first action button on a
+        -- 288 px phone page.
+        local name = make("TextLabel", {
+            Name = "Name", Text = "-", Size = UDim2.new(1, -172, 0, 18),
+            Position = UDim2.fromOffset(12, 8), BackgroundTransparency = 1,
+            Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = THEME.text,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+        }, row)
+        local distance = make("TextLabel", {
+            Name = "Distance", Text = "", Size = UDim2.new(1, -172, 0, 14),
+            Position = UDim2.fromOffset(12, 27), BackgroundTransparency = 1,
+            Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = THEME.dim,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+        }, row)
+        local function action(label, x, callback)
+            local button = make("TextButton", {
+                Name = "Nearby" .. label, Text = label, Size = UDim2.fromOffset(44, 44),
+                Position = UDim2.new(1, x, 0.5, -22), BackgroundColor3 = THEME.cardUp,
+                Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = THEME.text,
+                AutoButtonColor = false, BorderSizePixel = 0,
+            }, row)
+            corner(button, 9)
+            button.MouseButton1Click:Connect(function()
+                press(button)
+                if row.target then
+                    task.spawn(function()
+                        local ok, err = pcall(callback, row.target)
+                        if not ok then R.log("nearby action failed: " .. tostring(err), true) end
+                    end)
+                end
+            end)
+        end
+        action("TP", -146, function(target)
+            local root = R.root(target)
+            if root then R.teleportTo(root.CFrame * CFrame.new(0, 0, 3), target.Name) end
+        end)
+        action("KILL", -100, function(target) R.killTarget(target) end)
+        action("CUFF", -54, function(target) R.arrestTarget(target) end)
+        table.insert(S.ui.nearbyRows, { frame = row, name = name, distance = distance, target = nil })
+    end
+    S.ui.nearbyBox = box
+    S.ui.nearbyEmpty = empty
+    R.ui.refreshNearby()
+    return box
+end
+
+function R.ui.refreshNearby()
+    if not S.ui.nearbyRows then return end
+    local myRoot = R.root()
+    local list = {}
+    if myRoot then
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if R.validTarget(plr, C.auraTargets) then
+                local root = R.root(plr)
+                if root then
+                    table.insert(list, {
+                        plr = plr,
+                        distance = (root.Position - myRoot.Position).Magnitude,
+                    })
+                end
+            end
+        end
+        table.sort(list, function(a, b) return a.distance < b.distance end)
+    end
+    for index, row in ipairs(S.ui.nearbyRows) do
+        local entry = list[index]
+        if entry then
+            row.frame.Visible = true
+            row.target = entry.plr
+            row.name.Text = entry.plr.Name
+            row.distance.Text = string.format("%d studs · %s", math.floor(entry.distance),
+                R.teamName(entry.plr) ~= "" and R.teamName(entry.plr) or R.teamColorName(entry.plr))
+        else
+            row.frame.Visible = false
+            row.target = nil
+        end
+    end
+    if S.ui.nearbyEmpty then S.ui.nearbyEmpty.Visible = #list == 0 end
+end
+
+function R.ui.logBox(owner)
+    local wrap = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 150), BackgroundColor3 = THEME.card,
+        BorderSizePixel = 0,
+    }, owner)
+    corner(wrap, 10)
+    local label = make("TextLabel", {
+        Name = "LogLabel", Text = "log empty", Size = UDim2.new(1, -24, 1, -16),
+        Position = UDim2.fromOffset(12, 8), BackgroundTransparency = 1,
+        Font = Enum.Font.Code, TextSize = 11, TextColor3 = THEME.dim,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true,
+    }, wrap)
+    S.ui.logLabel = label
+    R.ui.refreshLog()
+    return wrap
+end
+
+function R.ui.refreshLog()
+    local label = S.ui.logLabel
+    if not label then return end
+    local first = math.max(1, #S.logLines - 7)
+    local lines = {}
+    for index = first, #S.logLines do table.insert(lines, S.logLines[index]) end
+    label.Text = #lines > 0 and table.concat(lines, "\n") or "log empty"
+end
+
+function R.ui.copyLog()
+    local text = table.concat(S.logLines, "\n")
+    if setclipboard then
+        local ok = pcall(function() setclipboard(text) end)
+        if ok then
+            R.toast("Copied", "Log copied to clipboard.", 2, "ok")
+            return true
+        end
+    end
+    R.toast("Copy unavailable", "This executor has no setclipboard.", 2, "warn")
+    return false
+end
+
+function R.ui.selfTest()
+    local checks = {}
+    local failures = 0
+    local function check(label, condition, detail)
+        table.insert(checks, string.format("%s %s%s", condition and "[OK]" or "[FAIL]",
+            label, detail and (" — " .. tostring(detail)) or ""))
+        if not condition then failures = failures + 1 end
+    end
+    check("ScreenGui", S.ui.screen ~= nil and S.ui.screen.Parent ~= nil)
+    check("safe insets", S.ui.safeInsets == true, "CoreUISafeInsets")
+    check("panel", S.ui.panel ~= nil)
+    check("pages", S.ui.pages ~= nil and #(S.ui.pageOrder or {}) >= 7)
+    check("viewport", S.layout.vw ~= nil and S.layout.vw > 0,
+        tostring(S.layout.vw) .. "x" .. tostring(S.layout.vh))
+    check("ItemHandler", R.remotes.item ~= nil, "may arrive with the map stream")
+    check("meleeEvent", R.remotes.melee ~= nil, "may arrive with the map stream")
+    check("ShootEvent", R.remotes.shoot ~= nil, "may arrive with the map stream")
+    check("character", R.character() ~= nil)
+    check("silent-aim hook", not S.toggles.silentOn or S.silentOld ~= nil
+        or hookmetamethod == nil,
+        S.toggles.silentOn and (hookmetamethod and "installed" or "executor has no hookmetamethod")
+        or "silent aim is off")
+    local summary = string.format("%d/%d checks passed", #checks - failures, #checks)
+    return table.concat(checks, "\n"), summary, failures
+end
+-- ============================================================================
+-- PAGES
+-- ============================================================================
+local S = R.state
+local C = R.config
+local Players = R.services.Players
+local UIS = R.services.UserInputService
+
+function R.pages.build()
+    local ui = R.ui
+
+    -- ------------------------------------------------------------------
+    -- HOME
+    -- ------------------------------------------------------------------
+    local home = ui.addPage("home", "HOME")
+    ui.section(home, "Session")
+    ui.statStrip(home, {
+        { label = "Actions", value = "0", key = "kills", color = R.theme.accent },
+        { label = "Cuffs", value = "0", key = "arrests", color = R.theme.good },
+        { label = "Items", value = "0", key = "items", color = R.theme.warn },
+    })
+    ui.info(home,
+        "Tap a tab to switch pages. Every row is sized for a thumb; the close "
+        .. "button is top-right. Remote calls are logged, never assumed successful.",
+        58)
+
+    ui.section(home, "One tap")
+    ui.pair(home, "Kill All", function() R.killAll() end,
+        "Arrest All", function() R.arrestAll() end)
+    ui.pair(home, "Taze All", function() R.tazeAll() end,
+        "Full Kit", function() R.giveKit() end)
+    ui.pair(home, "Open Gate", function() R.openGate() end,
+        "Respawn", function() R.respawn() end)
+
+    ui.section(home, "Nearby players")
+    ui.playerList(home)
+    ui.info(home,
+        "TP moves you behind the player. KILL sends the selected aura payload. "
+        .. "CUFF invokes the arrest remote; the count only increases when the "
+        .. "game shows the handcuffed GUI on the target.",
+        64)
+
+    -- ------------------------------------------------------------------
+    -- COMBAT
+    -- ------------------------------------------------------------------
+    local combat = ui.addPage("combat", "COMBAT")
+    ui.section(combat, "Kill aura")
+    ui.toggle(combat, "auraKillOn", "Kill Aura",
+        "Hits the nearest valid target inside the radius. Gun mode falls back to fists when no gun is available.",
+        false, function() ui.syncDock() end)
+    ui.slider(combat, "killRadius", "Radius", 10, 260, C.killAuraRadius,
+        function(value) C.killAuraRadius = math.floor(value + 0.5) end, " studs")
+    ui.slider(combat, "killPace", "Pace", 5, 100, math.floor(C.killAuraRate * 100),
+        function(value) C.killAuraRate = math.max(value / 100, 0.05) end, " cs")
+    ui.dropdown(combat, "killMode", "Attack mode", { "Fists", "Gun" }, C.killAuraMode,
+        function(value) C.killAuraMode = value end)
+    ui.dropdown(combat, "auraTargets", "Targets", { "All", "Inmates", "Guards", "Criminals" },
+        C.auraTargets, function(value) C.auraTargets = value end)
+    ui.toggle(combat, "respectFF", "Respect Forcefields",
+        "Skip spawn-shielded players instead of wasting the aura beat.", C.respectForcefield,
+        function(value) C.respectForcefield = value end)
+
+    ui.section(combat, "Arrest aura")
+    ui.toggle(combat, "auraArrestOn", "Arrest Aura",
+        "Cuffs the nearest non-guard in range that matches the Targets filter. Runs on its own guarded task so it cannot stall the kill aura.",
+        false, function() end)
+    ui.slider(combat, "arrestRadius", "Radius", 20, 500, C.arrestAuraRadius,
+        function(value) C.arrestAuraRadius = math.floor(value + 0.5) end, " studs")
+    ui.slider(combat, "arrestRate", "Cooldown", 0.4, 3, C.arrestAuraRate,
+        function(value) C.arrestAuraRate = value end, "s", 0.1)
+    ui.toggle(combat, "arrestSnap", "Snap Behind Target",
+        "Moves your root behind the target before invoking arrest. Client-side position only.",
+        C.arrestSnap, function(value) C.arrestSnap = value end)
+
+    ui.section(combat, "Taze loop")
+    ui.toggle(combat, "auraTazeOn", "Taze Loop",
+        "Cycles targets at the configured rate. Requires a Taser in the character or backpack.",
+        false, function() end)
+    ui.slider(combat, "tazeRate", "Taze cooldown", 0.2, 3, C.tazeRate,
+        function(value) C.tazeRate = value end, "s", 0.1)
+
+    ui.section(combat, "Aim assist")
+    ui.toggle(combat, "aimOn", "Aim Assist",
+        "Locks the camera toward the nearest head in the FOV. Desktop: hold RMB. Touch: tap AIM on the quick dock.",
+        false, function() ui.syncDock() end)
+    ui.slider(combat, "aimFov", "Aim FOV", 20, 500, C.aimbotFov,
+        function(value) C.aimbotFov = math.floor(value + 0.5) end, "°")
+    ui.slider(combat, "aimSmooth", "Smoothing", 0, 95, C.aimbotSmooth,
+        function(value) C.aimbotSmooth = math.floor(value + 0.5) end, "%")
+    ui.toggle(combat, "aimAlwaysLock", "Always Lock on Touch",
+        "If off, touch aim only locks while AIM is engaged on the dock. Keep it off for normal camera control.",
+        C.aimAlwaysLock, function(value) C.aimAlwaysLock = value end)
+    ui.dropdown(combat, "aimTargets", "Aim targets", { "All", "Inmates", "Guards", "Criminals" },
+        C.aimbotTargets, function(value) C.aimbotTargets = value end)
+
+    ui.section(combat, "Silent aim")
+    ui.toggle(combat, "silentOn", "Silent Aim",
+        "Re-points your own ShootEvent bullets at the nearest head on the wire. Requires hookmetamethod.",
+        false, function(value)
+            if value and not R.setupSilentAim() then
+                R.toast("Silent aim", "This executor has no hookmetamethod; the toggle was turned off.", 4, "err")
+                if S.switches.silentOn then S.switches.silentOn.Set(false, true) end
+            end
+        end)
+    ui.slider(combat, "silentFov", "Silent FOV", 20, 999, C.silentFov,
+        function(value) C.silentFov = math.floor(value + 0.5) end, "°")
+    ui.slider(combat, "silentHit", "Hit chance", 0, 100, C.silentHitChance,
+        function(value) C.silentHitChance = math.floor(value + 0.5) end, "%")
+    ui.toggle(combat, "silentWall", "Wall Check",
+        "Skip the re-aim when the head is behind geometry.", C.silentWallCheck,
+        function(value) C.silentWallCheck = value end)
+    ui.toggle(combat, "silentRandom", "Random Body Part",
+        "Sometimes aim at the torso instead of the head. Less consistent, less suspicious.", C.silentRandomPart,
+        function(value) C.silentRandomPart = value end)
+    ui.toggle(combat, "triggerOn", "Trigger Bot",
+        "Auto-activates a GunStates tool when a target is inside the aim cone. It does not fire while the panel is open.",
+        C.triggerOn, function(value) C.triggerOn = value end)
+
+    ui.section(combat, "Actions")
+    ui.pair(combat, "Kill All", function() R.killAll() end,
+        "Arrest All", function() R.arrestAll() end)
+    ui.button(combat, "Taze All Now", function() R.tazeAll() end)
+    ui.info(combat,
+        "Kill Aura uses meleeEvent; Gun mode uses the ShootEvent bullet table and a GunStates tool. "
+        .. "Neither can guarantee server damage — Prison Life validates the payload server-side.",
+        60)
+
+    -- ------------------------------------------------------------------
+    -- GEAR
+    -- ------------------------------------------------------------------
+    local gear = ui.addPage("gear", "GEAR")
+    local function pacingInfoText()
+        return "ItemHandler requests are paced to "
+            .. string.format("%.1f", C.itemPace)
+            .. "s apart. Lowering the pace can get the request rejected; the log will show it."
+    end
+    R.ui.refreshPacingInfo = function()
+        if S.ui.pacingLabel then S.ui.pacingLabel.Text = pacingInfoText() end
+    end
+    ui.section(gear, "Loadout")
+    ui.dropdown(gear, "gunChoice", "Preferred gun",
+        { "M9", "MP5", "Remington 870", "AK-47", "M4A1" }, C.gunChoice,
+        function(value) C.gunChoice = value end)
+    ui.button(gear, "Give Selected Gun", function() R.giveSelectedGun() end)
+    ui.button(gear, "Give Full Kit", function() R.giveKit() end)
+    ui.button(gear, "Give Riot Gear", function() R.giveRiotGear() end)
+    ui.pair(gear, "Key Card", function() R.giveNamedGear("Key card") end,
+        "Crude Knife", function() R.giveNamedGear("Crude Knife") end)
+    ui.button(gear, "Become Guard + Handcuffs", function() R.becomeGuardWithCuffs() end)
+    local gearInfo = ui.info(gear, pacingInfoText(), 58)
+    S.ui.pacingLabel = gearInfo and gearInfo:FindFirstChildOfClass("TextLabel") or nil
+
+    ui.section(gear, "Gun mods (client-side GunStates)")
+    ui.slider(gear, "gunDamage", "Damage", 1, 250, C.gunDamage,
+        function(value) C.gunDamage = math.floor(value + 0.5) end)
+    ui.slider(gear, "gunBullets", "Bullets per shot", 1, 30, C.gunBullets,
+        function(value) C.gunBullets = math.floor(value + 0.5) end)
+    ui.slider(gear, "gunFireRate", "Fire rate", 1, 100,
+        math.max(1, math.floor(C.gunFireRate * 10000)),
+        function(value) C.gunFireRate = math.max(value / 10000, 0.0001) end, "u")
+    ui.slider(gear, "gunSpread", "Spread", 0, 100, math.floor(C.gunSpread * 1000),
+        function(value) C.gunSpread = value / 1000 end, "u")
+    ui.toggle(gear, "infAmmo", "Infinite Ammo", "Pins CurrentAmmo to infinity in the client module.",
+        C.gunInfiniteAmmo, function(value) C.gunInfiniteAmmo = value end)
+    ui.toggle(gear, "autoFire", "Full Auto", "Sets the client AutoFire flag.",
+        C.gunAutoFire, function(value) C.gunAutoFire = value end)
+    ui.pair(gear, "Apply Mods", function()
+        local hits = R.modAllGuns()
+        R.toast("Gun mods", tostring(hits) .. " tool(s) rewritten client-side", 2,
+            hits > 0 and "ok" or "warn")
+    end, "Mod Selected", function() R.modSelectedGun() end)
+    ui.info(gear,
+        "GunStates is a client module. Rewriting it can change local recoil/ammo, but damage, "
+        .. "hit registration and ammo checks still belong to the server. Unload restores the fields we saved.",
+        64)
+
+    ui.section(gear, "Automation")
+    ui.toggle(gear, "autoRearm", "Auto Re-Arm",
+        "After a respawn, request the full gun list again and re-apply mods. Slow by design.",
+        C.autoRearm, function(value) C.autoRearm = value end)
+    ui.toggle(gear, "autoCollect", "Auto Collect",
+        "Pulls the nearest ITEMPICKUP part through ItemHandler at the paced interval.",
+        false, function() end)
+    ui.slider(gear, "collectRadius", "Collect radius", 40, 900, C.autoCollectRadius,
+        function(value) C.autoCollectRadius = math.floor(value + 0.5) end, " studs")
+    ui.slider(gear, "itemPace", "Item pacing", 0.5, 5, C.itemPace,
+        function(value)
+            C.itemPace = value
+            if R.ui.refreshPacingInfo then R.ui.refreshPacingInfo() end
+        end, "s", 0.1)
+
+    -- ------------------------------------------------------------------
+    -- VISION
+    -- ------------------------------------------------------------------
+    local vision = ui.addPage("vision", "VISION")
+    ui.section(vision, "ESP")
+    ui.toggle(vision, "espOn", "Player ESP",
+        "Name, distance, health bar and team tint over each living player.",
+        false, function(value)
+            if value then R.refreshEsp() else R.clearEsp() end
+        end)
+    ui.toggle(vision, "espNames", "Names", nil, C.espNames,
+        function(value) C.espNames = value end)
+    ui.toggle(vision, "espDistance", "Distance", nil, C.espDistance,
+        function(value) C.espDistance = value end)
+    ui.toggle(vision, "espHealth", "Health bar", nil, C.espHealth,
+        function(value) C.espHealth = value end)
+    ui.toggle(vision, "espTeam", "Team colors",
+        "Guards blue, inmates orange, criminals red.", C.espTeamColor,
+        function(value) C.espTeamColor = value end)
+    ui.toggle(vision, "espVisible", "Line of sight only",
+        "Raycasts from the camera to each head. More accurate, more expensive.",
+        C.espVisibleOnly, function(value) C.espVisibleOnly = value end)
+    ui.toggle(vision, "espTracers", "Tracers",
+        "Screen lines to visible targets. Requires the executor Drawing API.",
+        C.espTracers, function(value)
+            if value and not R.drawingOk then
+                R.toast("Tracers", "Drawing API is not available in this executor.", 3, "err")
+                if S.switches.espTracers then S.switches.espTracers.Set(false, true) end
+                C.espTracers = false
+            else
+                C.espTracers = value
+            end
+        end)
+
+    ui.section(vision, "Chams")
+    ui.toggle(vision, "chamsOn", "Character Chams",
+        "Team-colored Highlight on each player. Capped by Roblox's own highlight limit.",
+        false, function(value)
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr ~= R.lp then R.applyChams(plr) end
+            end
+            if value then R.refreshEsp() end
+        end)
+    ui.toggle(vision, "chamsWall", "Through Walls",
+        "AlwaysOnTop depth mode. Turn off for a less visually noisy result.",
+        C.chamsThroughWalls, function(value)
+            C.chamsThroughWalls = value
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr ~= R.lp then R.applyChams(plr) end
+            end
+        end)
+
+    ui.section(vision, "World")
+    ui.toggle(vision, "fullbright", "Fullbright",
+        "Bright ambient, no fog, no global shadows. Restored on unload.",
+        false, function(value) R.setFullbright(value) end)
+    ui.toggle(vision, "fpsBoost", "FPS Boost",
+        "Disables particles, trails, smoke, fire and beams. Restored on unload.",
+        false, function(value) R.setFpsBoost(value) end)
+    ui.slider(vision, "cameraFov", "Camera FOV", 30, 120, C.cameraFov,
+        function(value)
+            C.cameraFov = math.floor(value + 0.5)
+            R.setCameraFov(C.cameraFov)
+        end, "°")
+    ui.toggle(vision, "showAimFov", "Aim FOV ring",
+        "Draw the aim cone around the screen center while aim or silent aim is on.",
+        C.showAimFov, function(value) C.showAimFov = value end)
+    ui.info(vision,
+        "Highlights and ESP are client-side only. Other players do not see them. "
+        .. "If the phone drops frames, turn off line-of-sight ESP first, then tracers.",
+        58)
+
+    -- ------------------------------------------------------------------
+    -- MOVE
+    -- ------------------------------------------------------------------
+    local move = ui.addPage("move", "MOVE")
+    ui.section(move, "Locomotion")
+    ui.slider(move, "walkSpeed", "Walk speed", 8, 250, C.walkSpeed,
+        function(value)
+            C.walkSpeed = math.floor(value + 0.5)
+            S.forceWalk = true
+        end, " studs")
+    ui.slider(move, "jumpPower", "Jump power", 8, 250, C.jumpPower,
+        function(value)
+            C.jumpPower = math.floor(value + 0.5)
+            S.forceJump = true
+        end)
+    ui.toggle(move, "infJump", "Infinite Jump",
+        "Re-triggers the jump state on JumpRequest. No extra keys.", false,
+        function() end)
+    ui.toggle(move, "antiStun", "Anti-Stun",
+        "If a taze sets WalkSpeed to 0, restore the configured speed on the next heartbeat.",
+        C.antiStun, function(value) C.antiStun = value end)
+    ui.button(move, "Reset Movement", function()
+        C.walkSpeed = 16
+        C.jumpPower = 50
+        S.forceWalk = false
+        S.forceJump = false
+        if S.sliders.walkSpeed then S.sliders.walkSpeed.Set(16, true) end
+        if S.sliders.jumpPower then S.sliders.jumpPower.Set(50, true) end
+        R.restoreMovement()
+        R.toast("Movement", "WalkSpeed 16 · JumpPower 50", 2, "ok")
+    end)
+
+    ui.section(move, "Collision")
+    ui.toggle(move, "noclipOn", "Noclip",
+        "Every character part becomes non-collidable. Original CanCollide values are restored on off/unload.",
+        false, function(value)
+            if value then R.setNoclip(true) else R.restoreNoclip() end
+        end)
+
+    ui.section(move, "Flight")
+    ui.toggle(move, "flyOn", "Fly",
+        "Phone: use the normal movement joystick for horizontal flight and the ▲/▼ buttons for altitude. PC: WASD + Q/E.",
+        false, function(value)
+            if not value then R.stopFly() end
+            R.ui.syncOverlay()
+        end)
+    ui.slider(move, "flySpeed", "Fly speed", 1, 30, C.flySpeed,
+        function(value) C.flySpeed = value end, "", 0.5)
+    ui.toggle(move, "tpWalkOn", "TP-Walk",
+        "Adds a frame-rate-independent step along your movement direction.", false,
+        function() end)
+    ui.slider(move, "tpWalkPower", "TP-Walk power", 1, 15, C.tpWalkPower,
+        function(value) C.tpWalkPower = value end)
+    ui.toggle(move, "spinOn", "Spin", "Rotates your root at the configured speed.", false,
+        function() end)
+    ui.slider(move, "spinSpeed", "Spin speed", 10, 180, C.spinSpeed,
+        function(value) C.spinSpeed = math.floor(value + 0.5) end, "°")
+    ui.info(move,
+        "Fly is a client-side CFrame move. It can be rubber-banded by the server and does not "
+        .. "grant collision immunity; use Noclip only when you accept that risk.",
+        58)
+
+    -- ------------------------------------------------------------------
+    -- WORLD
+    -- ------------------------------------------------------------------
+    local world = ui.addPage("world", "WORLD")
+    ui.section(world, "Teleports")
+    ui.pair(world, "Yard", function()
+        R.teleportTo(CFrame.new(916.81, 99.99, 2373.38), "Yard")
+    end, "Guard Spawn", function()
+        R.teleportTo(CFrame.new(837.35, 99.99, 2303.22), "Guard Spawn")
+    end)
+    ui.pair(world, "Cafeteria", function()
+        R.teleportTo(CFrame.new(945.71, 99.80, 2320.33), "Cafeteria")
+    end, "Police Room", function()
+        R.teleportTo(CFrame.new(909.45, 99.99, 2258.89), "Police Room")
+    end)
+    ui.pair(world, "Gate Button", function()
+        R.teleportTo(CFrame.new(504.53, 104.91, 2240.84), "Gate Button")
+    end, "Riot Gear", function()
+        R.teleportTo(CFrame.new(853.40, 100.70, 2216.49), "Riot Gear Stand")
+    end)
+    ui.pair(world, "Criminal Base", function()
+        R.teleportTo(CFrame.new(-938.77, 94.13, 2063.85), "Criminal Base")
+    end, "Crim Hammer", function()
+        R.teleportTo(CFrame.new(808.08, 95.59, 2525.31), "Crim Base Hammer")
+    end)
+    ui.pair(world, "Armory", function()
+        R.teleportToItem("M9", "Armory")
+    end, "Nearest Player", function()
+        R.teleportNearestPlayer()
+    end)
+    ui.info(world,
+        "Coordinates are from the public Prison Life map. If a major map update moves a location, "
+        .. "Armory/Nearest Player use live parts instead of constants.",
+        52)
+
+    ui.section(world, "Prison")
+    ui.button(world, "Open Prison Gate", function() R.openGate() end)
+    ui.toggle(world, "gateLoopOn", "Gate Loop",
+        "Re-sends the gate button request on the interval below. Respects item pacing.", false,
+        function() end)
+    ui.slider(world, "gateInterval", "Gate interval", 0.5, 6, C.gateSpamInterval,
+        function(value) C.gateSpamInterval = value end, "s", 0.5)
+    ui.toggle(world, "barriers", "Walk Through Doors + Fences",
+        "Reversible client-side CanCollide change on workspace.Doors and Prison_Fences.",
+        false, function(value) R.setBarriers(value) end)
+
+    ui.section(world, "Team")
+    ui.pair(world, "Guard", function() R.switchTeam("Guard") end,
+        "Inmate", function() R.switchTeam("Inmate") end)
+    ui.button(world, "Neutral", function() R.switchTeam("Neutral") end)
+    ui.info(world,
+        "A team switch is reported as confirmed only if LocalPlayer.Team/TeamColor updates on the client. "
+        .. "Otherwise the toast says the request was unconfirmed.",
+        52)
+
+    ui.section(world, "Session")
+    ui.toggle(world, "antiAfk", "Anti-AFK",
+        "VirtualUser nudge on the Idled event. Uses the executor's normal controller API.",
+        C.antiAfk, function(value) C.antiAfk = value end)
+    ui.toggle(world, "instantRespawn", "Instant Respawn",
+        "On death, waits 0.6s then invokes loadchar. It does not bypass the server's respawn rules.",
+        C.instantRespawn, function(value) C.instantRespawn = value end)
+    ui.pair(world, "Respawn", function() R.respawn() end,
+        "Rebind Remotes", function()
+            local M = R.rebindRemotes()
+            R.toast("Remotes", "melee " .. tostring(M.melee ~= nil)
+                .. " · shoot " .. tostring(M.shoot ~= nil)
+                .. " · item " .. tostring(M.item ~= nil), 3, "ok")
+        end)
+    ui.button(world, "Rejoin Server", function() R.rejoin() end, { variant = "danger" })
+
+    -- ------------------------------------------------------------------
+    -- SETUP
+    -- ------------------------------------------------------------------
+    local setup = ui.addPage("setup", "SETUP")
+    ui.section(setup, "Diagnostics")
+    local diag = ui.info(setup,
+        "Tap Run Self-Test to check the UI, remotes, character and executor capabilities.",
+        104)
+    local diagLabel = diag:FindFirstChildOfClass("TextLabel")
+    S.ui.diagLabel = diagLabel
+    S.ui.diagBox = diag
+    ui.button(setup, "Run Self-Test", function()
+        local text, summary, failures = R.ui.selfTest()
+        local full = summary .. "\n" .. text
+        if S.ui.diagLabel then S.ui.diagLabel.Text = full end
+        if S.ui.diagBox then
+            -- Grow the diagnostics card instead of clipping the report in the
+            -- fixed 104 px default. Count wrapped visual lines as well as
+            -- explicit newlines, because a 320 px phone wraps check labels.
+            local lines = 1
+            for _ in string.gmatch(full, "\n") do lines = lines + 1 end
+            local vw = R.viewport().X
+            local contentWidth = (vw < 760 and (vw - 80)) or 620
+            local charsPerLine = math.max(28, math.floor(contentWidth / 6.4))
+            local visualLines = math.max(lines, math.ceil(#full / charsPerLine))
+            S.ui.diagBox.Size = UDim2.new(1, 0, 0,
+                math.clamp(20 + visualLines * 14, 104, 480))
+        end
+        R.log("self-test: " .. summary, failures > 0)
+        R.toast("Self-test", summary, 3, failures > 0 and "warn" or "ok")
+    end)
+    ui.button(setup, "Copy Log", function() R.ui.copyLog() end)
+
+    ui.section(setup, "Config")
+    ui.button(setup, "Save Config", function() R.saveConfig() end)
+    ui.button(setup, "Load Config", function() R.loadConfig() end)
+    ui.button(setup, "Reset Config", function() R.resetConfig() end)
+
+    ui.section(setup, "Interface")
+    ui.toggle(setup, "reduceAnim", "Reduce Animations",
+        "Disable tweens and scale bumps. Recommended on low-end phones.",
+        C.reduceAnim, function(value) C.reduceAnim = value end)
+    ui.toggle(setup, "quickDockOn", "Quick Action Dock",
+        "The vertical MENU/AURA/AIM/FLY strip while the panel is closed. On short landscape it becomes a bottom bar.",
+        C.quickDock, function(value)
+            C.quickDock = value
+            R.ui.syncOverlay()
+        end)
+    ui.info(setup,
+        "The hub uses CoreUISafeInsets + ClipToDeviceSafeArea where the client supports it, "
+        .. "and falls back to the normal topbar inset on older clients. Layout is recomputed on rotation.",
+        58)
+
+    ui.section(setup, "Session control")
+    ui.pair(setup, "Close Panel", function() R.ui.openPanel(false) end,
+        "Unload", function()
+            if R.Unload then R.Unload() end
+        end)
+    ui.section(setup, "Activity log")
+    ui.logBox(setup)
+    ui.info(setup,
+        "Riot Hub Mobile v4.0. Original Riothub.lua and PL-Vortex-7.1 are preserved. "
+        .. "No external loadstrings, key system, or pastebin dependency.",
+        52)
+end
+-- ============================================================================
+-- RUNTIME — boot, loops, hotkeys, config persistence, restore-on-unload
+-- ============================================================================
+local S = R.state
+local C = R.config
+local Players = R.services.Players
+local UIS = R.services.UserInputService
+local RunService = R.services.RunService
+local HttpService = R.services.HttpService
+
+local SAVE_FILE = "RiotHubMobile.json"
+local booted = false
+local runtimeStarted = false
+local characterBound = nil
+local characterDeathConnection = nil
+
+-- ============================================================================
+-- TOGGLE / CONFIG BRIDGE
+-- ============================================================================
+function R.setToggle(id, value)
+    local switch = S.switches and S.switches[id]
+    if switch then
+        switch.Set(value == true)
+    else
+        S.toggles[id] = value == true
+    end
+end
+
+function R.flipToggle(id)
+    R.setToggle(id, not (S.toggles[id] == true))
+end
+
+function R.ui.refreshStats()
+    local labels = S.ui.statLabels
+    if not labels then return end
+    if labels.kills then labels.kills.Text = tostring(S.killCounter or 0) end
+    if labels.arrests then labels.arrests.Text = tostring(S.arrestCount or 0) end
+    if labels.items then labels.items.Text = tostring(S.itemCount or 0) end
+end
+
+-- Push the loaded/default config into the existing controls without firing
+-- their callbacks a second time, then apply the active effects explicitly.
+function R.ui.applyConfig()
+    local function slider(id, value)
+        local control = S.sliders and S.sliders[id]
+        if control then control.Set(value, true) end
+    end
+    local function toggle(id, value)
+        local control = S.switches and S.switches[id]
+        if control then control.Set(value == true, true) end
+    end
+    local function dropdown(id, value)
+        local control = S.dropdowns and S.dropdowns[id]
+        if control then control.Set(value) end
+    end
+
+    slider("killRadius", C.killAuraRadius)
+    slider("killPace", math.floor(C.killAuraRate * 100 + 0.5))
+    slider("arrestRadius", C.arrestAuraRadius)
+    slider("arrestRate", C.arrestAuraRate)
+    slider("tazeRate", C.tazeRate)
+    slider("aimFov", C.aimbotFov)
+    slider("aimSmooth", C.aimbotSmooth)
+    slider("silentFov", C.silentFov)
+    slider("silentHit", C.silentHitChance)
+    slider("gunDamage", C.gunDamage)
+    slider("gunBullets", C.gunBullets)
+    slider("gunFireRate", math.max(1, math.floor(C.gunFireRate * 10000 + 0.5)))
+    slider("gunSpread", math.floor(C.gunSpread * 1000 + 0.5))
+    slider("collectRadius", C.autoCollectRadius)
+    slider("itemPace", C.itemPace)
+    slider("cameraFov", C.cameraFov)
+    slider("walkSpeed", C.walkSpeed)
+    slider("jumpPower", C.jumpPower)
+    slider("flySpeed", C.flySpeed)
+    slider("tpWalkPower", C.tpWalkPower)
+    slider("spinSpeed", C.spinSpeed)
+    slider("gateInterval", C.gateSpamInterval)
+
+    toggle("respectFF", C.respectForcefield)
+    toggle("arrestSnap", C.arrestSnap)
+    toggle("aimAlwaysLock", C.aimAlwaysLock)
+    toggle("silentWall", C.silentWallCheck)
+    toggle("silentRandom", C.silentRandomPart)
+    toggle("triggerOn", C.triggerOn)
+    toggle("infAmmo", C.gunInfiniteAmmo)
+    toggle("autoFire", C.gunAutoFire)
+    toggle("autoRearm", C.autoRearm)
+    toggle("espNames", C.espNames)
+    toggle("espDistance", C.espDistance)
+    toggle("espHealth", C.espHealth)
+    toggle("espTeam", C.espTeamColor)
+    toggle("espVisible", C.espVisibleOnly)
+    toggle("espTracers", C.espTracers)
+    toggle("chamsWall", C.chamsThroughWalls)
+    toggle("showAimFov", C.showAimFov)
+    toggle("antiStun", C.antiStun)
+    toggle("antiAfk", C.antiAfk)
+    toggle("instantRespawn", C.instantRespawn)
+    toggle("reduceAnim", C.reduceAnim)
+    toggle("quickDockOn", C.quickDock)
+
+    dropdown("killMode", C.killAuraMode)
+    dropdown("auraTargets", C.auraTargets)
+    dropdown("aimTargets", C.aimbotTargets)
+    dropdown("gunChoice", C.gunChoice)
+
+    S.forceWalk = C.walkSpeed ~= 16
+    S.forceJump = C.jumpPower ~= 50
+    -- Loading or resetting a config is an explicit request for the values in
+    -- that config. If the incoming movement values are the defaults, put the
+    -- humanoid back to its captured baseline instead of leaving a previous
+    -- forced speed in place.
+    local humanoid = R.humanoid()
+    if humanoid and S.movementBase then
+        if not S.forceWalk then
+            pcall(function() humanoid.WalkSpeed = S.movementBase.WalkSpeed end)
+        end
+        if not S.forceJump then
+            pcall(function() humanoid.JumpPower = S.movementBase.JumpPower end)
+        end
+    end
+    if R.setCameraFov then R.setCameraFov(C.cameraFov) end
+    if R.ui.refreshPacingInfo then R.ui.refreshPacingInfo() end
+    if R.ui.refreshNearby then R.ui.refreshNearby() end
+    if S.toggles.fullbright and R.setFullbright then R.setFullbright(true) end
+    if S.toggles.fpsBoost and R.setFpsBoost then R.setFpsBoost(true) end
+    if S.toggles.noclipOn and R.setNoclip then R.setNoclip(true) end
+    if S.toggles.barriers and R.setBarriers then R.setBarriers(true) end
+    if S.toggles.espOn and R.refreshEsp then R.refreshEsp() end
+    if S.toggles.silentOn and R.setupSilentAim then R.setupSilentAim() end
+    if R.ui.syncDock then R.ui.syncDock() end
+    if R.ui.syncOverlay then R.ui.syncOverlay() end
+end
+
+-- ============================================================================
+-- CONFIG PERSISTENCE
+-- ============================================================================
+function R.saveConfig()
+    local encoder = HttpService and HttpService.JSONEncode
+    if not encoder then
+        R.toast("Save failed", "HttpService JSONEncode is unavailable.", 3, "err")
+        return false
+    end
+    local ok, body = pcall(function() return HttpService:JSONEncode(C) end)
+    if not ok or type(body) ~= "string" then
+        R.log("config encode failed: " .. tostring(body), true)
+        R.toast("Save failed", "Config could not be encoded.", 3, "err")
+        return false
+    end
+    if type(writefile) ~= "function" then
+        R.toast("Save unavailable", "This executor does not expose writefile().", 3, "err")
+        return false
+    end
+    local wrote, err = pcall(function() writefile(SAVE_FILE, body) end)
+    if not wrote then
+        R.log("writefile failed: " .. tostring(err), true)
+        R.toast("Save failed", tostring(err):sub(1, 90), 3, "err")
+        return false
+    end
+    R.log("config saved to " .. SAVE_FILE .. " (" .. #body .. " bytes)")
+    R.toast("Config saved", SAVE_FILE, 2, "ok")
+    return true
+end
+
+local function sanitizeConfig()
+    -- These ranges mirror the slider bounds in 04_pages.lua exactly. Loading a
+    -- value outside the range would leave the runtime using a number the
+    -- control cannot display or reproduce.
+    local limits = {
+        itemPace = { 0.5, 5 },
+        killAuraRate = { 0.05, 1 },
+        arrestAuraRate = { 0.4, 3 },
+        tazeRate = { 0.2, 3 },
+        killAuraRadius = { 10, 260 },
+        arrestAuraRadius = { 20, 500 },
+        autoCollectRadius = { 40, 900 },
+        aimbotFov = { 20, 500 },
+        aimbotSmooth = { 0, 95 },
+        silentFov = { 20, 999 },
+        silentHitChance = { 0, 100 },
+        gunDamage = { 1, 250 },
+        gunBullets = { 1, 30 },
+        gunFireRate = { 0.0001, 0.01 },
+        gunSpread = { 0, 0.1 },
+        cameraFov = { 30, 120 },
+        walkSpeed = { 8, 250 },
+        jumpPower = { 8, 250 },
+        flySpeed = { 1, 30 },
+        tpWalkPower = { 1, 15 },
+        spinSpeed = { 10, 180 },
+        gateSpamInterval = { 0.5, 6 },
+        meleeBurstHits = { 1, 10 },
+        gunBulletsPerCall = { 1, 30 },
+        maxLogLines = { 10, 300 },
+    }
+    for key, range in pairs(limits) do
+        local value = tonumber(C[key])
+        if value then C[key] = math.clamp(value, range[1], range[2]) end
+    end
+    -- Quantize the same way the sliders do, so the value used at runtime is
+    -- exactly the value the loaded control shows.
+    for _, key in ipairs({
+        "killAuraRadius", "arrestAuraRadius", "autoCollectRadius",
+        "aimbotFov", "aimbotSmooth", "silentFov", "silentHitChance",
+        "gunDamage", "gunBullets", "cameraFov", "walkSpeed", "jumpPower",
+        "tpWalkPower", "spinSpeed", "meleeBurstHits", "gunBulletsPerCall",
+        "maxLogLines",
+    }) do
+        C[key] = math.floor(C[key] + 0.5)
+    end
+    C.killAuraRate = math.floor(C.killAuraRate * 100 + 0.5) / 100
+    C.gunFireRate = math.floor(C.gunFireRate * 10000 + 0.5) / 10000
+    C.gunSpread = math.floor(C.gunSpread * 1000 + 0.5) / 1000
+    C.itemPace = math.floor(C.itemPace * 10 + 0.5) / 10
+    C.arrestAuraRate = math.floor(C.arrestAuraRate * 10 + 0.5) / 10
+    C.tazeRate = math.floor(C.tazeRate * 10 + 0.5) / 10
+    C.flySpeed = math.floor(C.flySpeed * 2 + 0.5) / 2
+    C.gateSpamInterval = math.floor(C.gateSpamInterval * 2 + 0.5) / 2
+
+    local modes = { Fists = true, Gun = true }
+    if not modes[C.killAuraMode] then C.killAuraMode = "Fists" end
+    local filters = { All = true, Inmates = true, Guards = true, Criminals = true }
+    if not filters[C.auraTargets] then C.auraTargets = "All" end
+    if not filters[C.aimbotTargets] then C.aimbotTargets = "All" end
+    local guns = {}
+    for _, gun in ipairs(R.GUNS or {}) do guns[gun] = true end
+    if not guns[C.gunChoice] then C.gunChoice = "M9" end
+    if not R.drawingOk then C.espTracers = false end
+end
+
+function R.loadConfig()
+    if type(readfile) ~= "function" then
+        R.toast("Load unavailable", "This executor does not expose readfile().", 3, "err")
+        return false
+    end
+    local ok, body = pcall(function() return readfile(SAVE_FILE) end)
+    if not ok or type(body) ~= "string" or #body == 0 then
+        R.log("config read failed: " .. tostring(body), true)
+        R.toast("Load failed", "No readable " .. SAVE_FILE .. ".", 3, "err")
+        return false
+    end
+    local decodedOk, decoded = pcall(function() return HttpService:JSONDecode(body) end)
+    if not decodedOk or type(decoded) ~= "table" then
+        R.log("config decode failed: " .. tostring(decoded), true)
+        R.toast("Load failed", "The saved config is not valid JSON.", 3, "err")
+        return false
+    end
+    local applied = 0
+    for key, defaultValue in pairs(R.defaultConfig) do
+        local incoming = decoded[key]
+        if type(incoming) == type(defaultValue) then
+            C[key] = incoming
+            applied = applied + 1
+        elseif type(defaultValue) == "number" and type(incoming) == "string" then
+            local number = tonumber(incoming)
+            if number then
+                C[key] = number
+                applied = applied + 1
+            end
+        end
+    end
+    sanitizeConfig()
+    R.ui.applyConfig()
+    R.log("config loaded from " .. SAVE_FILE .. " (" .. applied .. " values)")
+    R.toast("Config loaded", tostring(applied) .. " values applied", 2, "ok")
+    return true
+end
+
+function R.resetConfig()
+    for key, value in pairs(R.defaultConfig) do C[key] = value end
+    sanitizeConfig()
+    R.ui.applyConfig()
+    R.log("config reset to defaults")
+    R.toast("Config reset", "Config values restored; session-only toggles were left alone.", 2, "ok")
+    return true
+end
+
+-- ============================================================================
+-- INPUT / CHARACTER / VIEWPORT
+-- ============================================================================
+local function bindViewport()
+    local camera = workspace and workspace.CurrentCamera
+    if not camera then return end
+    local ok, signal = pcall(function() return camera:GetPropertyChangedSignal("ViewportSize") end)
+    if ok and signal then
+        R.connect(signal, function()
+            if not S.detached then R.ui.layout() end
+        end)
+    end
+end
+
+local function bindCharacter(character)
+    if not character or character == characterBound then return end
+    -- A respawn creates a new Humanoid. Drop the previous character's Died
+    -- connection instead of accumulating one handler per life.
+    if characterDeathConnection then
+        pcall(function() characterDeathConnection:Disconnect() end)
+        characterDeathConnection = nil
+    end
+    characterBound = character
+    R.captureMovementBase()
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        characterDeathConnection = R.connect(humanoid.Died, function()
+            if S.detached or not C.instantRespawn then return end
+            task.delay(0.6, function()
+                if S.detached then return end
+                if R.lp.Character == character then R.respawn() end
+            end)
+        end)
+    end
+
+    if C.autoRearm then
+        task.delay(1.5, function()
+            if S.detached or S.itemBusy then return end
+            S.itemBusy = true
+            for _, gun in ipairs(R.GUNS) do
+                if S.detached then break end
+                R.giveBest(gun, "giver")
+            end
+            if not S.detached then R.modAllGuns() end
+            S.itemBusy = false
+        end)
+    end
+end
+
+local function installInput()
+    R.connect(UIS.InputBegan, function(input, gameProcessed)
+        if S.detached or gameProcessed then return end
+        if UIS.GetFocusedTextBox and UIS:GetFocusedTextBox() then return end
+        local key = input.KeyCode
+        if key == Enum.KeyCode.RightControl or key == Enum.KeyCode.RightShift then
+            R.ui.openPanel(not S.open)
+        elseif key == Enum.KeyCode.G then
+            R.flipToggle("auraKillOn")
+        elseif key == Enum.KeyCode.H then
+            R.flipToggle("auraArrestOn")
+        elseif key == Enum.KeyCode.J then
+            R.flipToggle("auraTazeOn")
+        elseif key == Enum.KeyCode.K then
+            R.flipToggle("flyOn")
+        end
+    end)
+
+    R.connect(UIS.JumpRequest, function()
+        if S.detached or not S.toggles.infJump then return end
+        local humanoid = R.humanoid()
+        if not humanoid then return end
+        local okState, state = pcall(function() return humanoid:GetState() end)
+        if okState and state == Enum.HumanoidStateType.Dead then return end
+        pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Jumping) end)
+    end)
+
+    R.connect(Players.LocalPlayer.CharacterAdded, function(character)
+        if S.detached then return end
+        bindCharacter(character)
+    end)
+
+    R.connect(Players.LocalPlayer.Idled, function()
+        if S.detached or not C.antiAfk then return end
+        R.antiAfkNow()
+    end)
+
+    bindCharacter(Players.LocalPlayer.Character)
+    bindViewport()
+
+    local okWorkspace, workspaceSignal = pcall(function()
+        return workspace:GetPropertyChangedSignal("CurrentCamera")
+    end)
+    if okWorkspace and workspaceSignal then
+        R.connect(workspaceSignal, function()
+            if not S.detached then bindViewport() end
+        end)
+    end
+end
+
+-- ============================================================================
+-- LOOPS
+-- ============================================================================
+local function guardedAction(flag, label, fn)
+    if S[flag] then return false end
+    S[flag] = true
+    task.spawn(function()
+        local ok, err = pcall(fn)
+        S[flag] = false
+        if not ok and not S.detached then
+            R.log(label .. " failed: " .. tostring(err), true)
+        end
+    end)
+    return true
+end
+
+local function startCombatBrain()
+    task.spawn(function()
+        while not S.detached do
+            local now = R.now()
+
+            if S.toggles.auraKillOn and not S.killBusy
+                and now - (S.lastKillAt or 0) >= math.max(C.killAuraRate, 0.1) then
+                local target = R.nearest(C.auraTargets, C.killAuraRadius)
+                if target then
+                    S.lastKillAt = now
+                    guardedAction("killBusy", "kill aura", function()
+                        R.killTarget(target)
+                    end)
+                end
+            end
+
+            if S.toggles.auraArrestOn and not S.arrestBusy
+                and now - (S.lastArrestAt or 0) >= math.max(C.arrestAuraRate, 0.2) then
+                local target = R.nearestArrestable(C.arrestAuraRadius)
+                if target then
+                    S.lastArrestAt = now
+                    guardedAction("arrestBusy", "arrest aura", function()
+                        R.arrestTarget(target)
+                    end)
+                end
+            end
+
+            if S.toggles.auraTazeOn and not S.tazeBusy
+                and now - (S.lastTazeAt or 0) >= math.max(C.tazeRate, 0.1) then
+                local taser = R.getTaser()
+                if taser then
+                    local target = R.nearest(C.auraTargets, C.killAuraRadius)
+                    if target then
+                        S.lastTazeAt = now
+                        guardedAction("tazeBusy", "taze loop", function()
+                            R.tazeTarget(target, taser)
+                        end)
+                    end
+                elseif not S.tazeWarned then
+                    S.tazeWarned = true
+                    R.log("taze loop is on but no Taser is carried", true)
+                end
+            end
+
+            if S.toggles.gateLoopOn and not S.gateBusy
+                and now - (S.lastGateAt or 0) >= math.max(C.gateSpamInterval, 0.5) then
+                S.lastGateAt = now
+                task.spawn(function()
+                    S.gateBusy = true
+                    R.openGate()
+                    S.gateBusy = false
+                end)
+            end
+
+            if S.toggles.autoCollect and not S.itemBusy
+                and now - (S.lastCollectAt or 0) >= math.max(C.itemPace, 0.8) then
+                S.lastCollectAt = now
+                task.spawn(function()
+                    S.itemBusy = true
+                    local ok, err = pcall(function()
+                        R.collectNearest(C.autoCollectRadius)
+                    end)
+                    S.itemBusy = false
+                    if not ok then R.log("auto collect failed: " .. tostring(err), true) end
+                end)
+            end
+
+            task.wait(0.1)
+        end
+    end)
+end
+
+local function startHousekeeping()
+    task.spawn(function()
+        while not S.detached do
+            R.ui.refreshStats()
+            if S.open and S.activeTab == "home" and R.ui.refreshNearby then
+                R.ui.refreshNearby()
+            end
+            if R.ui.syncStatus then R.ui.syncStatus() end
+            task.wait(0.5)
+        end
+    end)
+end
+
+local function startHeartbeat()
+    R.connect(RunService.Heartbeat, function(dt)
+        if S.detached then return end
+        local step = math.clamp(tonumber(dt) or 0.016, 0.001, 0.1)
+        R.applyMovement(step)
+        R.updateAim(step)
+        R.triggerTick()
+
+        S.frameCount = S.frameCount + 1
+        S.fpsAccum = (S.fpsAccum or 0) + step
+        if S.fpsAccum >= 0.5 then
+            S.fps = math.floor(S.frameCount / S.fpsAccum + 0.5)
+            S.frameCount = 0
+            S.fpsAccum = 0
+        end
+
+        S.visualClock = (S.visualClock or 0) + step
+        if S.visualClock >= 0.12 then
+            S.visualClock = 0
+            R.updateEsp()
+            R.updateTracers()
+        end
+
+        local viewport = R.viewport()
+        if viewport.X ~= S.layout.vw or viewport.Y ~= S.layout.vh then
+            R.ui.layout()
+        end
+    end)
+end
+
+local function startRuntime()
+    if runtimeStarted then return end
+    runtimeStarted = true
+    installInput()
+    startCombatBrain()
+    startHousekeeping()
+    startHeartbeat()
+end
+
+-- ============================================================================
+-- BOOT
+-- ============================================================================
+function R.boot()
+    if booted then return end
+    booted = true
+    R.ui.buildBase()
+    R.pages.build()
+    R.buildAimRing()
+    R.resolveRemotes()
+    R.captureMovementBase()
+    startRuntime()
+    R.ui.finish()
+    S.loaded = true
+    R.env.RiotHubMobile = R
+    R.log("RiotHub Mobile v" .. R.version .. " loaded · "
+        .. (S.isTouch and "touch" or "desktop") .. " layout")
+    R.log("Unload restores movement, noclip, lighting, particles, camera and gun fields")
+end
+
+-- ============================================================================
+-- UNLOAD
+-- ============================================================================
+function R.Unload()
+    if S.detached then return end
+    S.detached = true
+
+    R.disconnectAll()
+    S.activeDrag = nil
+    if S.ui.closePicker then pcall(R.ui.closePicker) end
+
+    pcall(R.clearEsp)
+    pcall(R.removeSilentAim)
+    pcall(R.setFullbright, false)
+    pcall(R.setFpsBoost, false)
+    pcall(R.setBarriers, false)
+    pcall(R.restoreNoclip)
+    pcall(R.restoreGuns)
+    pcall(R.restoreMovement)
+    pcall(R.stopFly)
+    pcall(R.restoreCamera)
+
+    if S.ui.fovScreen then
+        pcall(function() S.ui.fovScreen:Destroy() end)
+        S.ui.fovScreen = nil
+        S.ui.fovRing = nil
+    end
+    if S.ui.screen then
+        pcall(function() S.ui.screen:Destroy() end)
+        S.ui.screen = nil
+    end
+    if S.ui.espFolder then
+        pcall(function() S.ui.espFolder:Destroy() end)
+        S.ui.espFolder = nil
+    end
+
+    S.picker = nil
+    S.ui.picker = nil
+    S.ui.pickerScrim = nil
+    S.ui.panel = nil
+    S.ui.header = nil
+    S.ui.tabHolder = nil
+    S.ui.pageHost = nil
+    S.ui.dock = nil
+    S.ui.orb = nil
+    S.ui.toastHolder = nil
+    S.ui.pages = nil
+    S.ui.tabs = nil
+    S.ui.dockButtons = nil
+    S.open = false
+    S.loaded = false
+
+    if R.env and R.env.RiotHubMobile == R then R.env.RiotHubMobile = nil end
+    print("[RiotHub] unloaded; restored game state")
+end
+
+R.boot()
